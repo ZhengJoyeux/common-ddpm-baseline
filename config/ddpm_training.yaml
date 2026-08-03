@@ -1,0 +1,139 @@
+# ============================================================
+# 普通无条件一维 DDPM 配置
+# 输入光谱已经完成平滑、基线校正等预处理。
+# 本程序只做：
+#   1. 训练集全局 Min-Max 数值缩放
+#   2. 1901 -> 1904 的右侧补零
+# 不再做平滑、去噪或基线校正。
+# ============================================================
+
+project:
+  name: sers_unconditional_ddpm
+  random_seed: 2026
+
+data:
+  input_directory: data/input
+  recursive: true
+
+  allowed_extensions:
+    - .xlsx
+    - .xls
+    - .csv
+
+  sheet_name: 0
+  header_row: 0
+  raman_shift_column: 0
+  intensity_start_column: 1
+
+  require_same_raman_shift_axis: false
+  raman_shift_tolerance: 1.0e-6
+  raman_range_tolerance: 1.0
+
+  original_spectrum_length: auto
+  model_spectrum_length: auto
+
+  padding_mode: right_zero_padding
+  length_adaptation: raman_axis_interpolation
+  padding_value: 0.0
+
+  split_unit: source_file
+  train_ratio: 0.8
+  validation_ratio: 0.1
+  test_ratio: 0.1
+  shuffle: true
+
+
+
+normalization:
+  enabled: true
+  method: global_minmax
+  fit_on: train_only
+  target_min: -1.0
+  target_max: 1.0
+  clip: false
+  epsilon: 1.0e-12
+  save_in_checkpoint: true
+
+model:
+  channels: 1
+  model_dimension: 64
+
+  dimension_multipliers:
+    - 1
+    - 2
+    - 4
+    - 8
+
+  dropout: 0.0
+  self_condition: false
+
+  diffusion_timesteps: 1000
+  sampling_timesteps: 1000
+  objective: pred_x0
+  beta_schedule: cosine
+  ddim_sampling_eta: 0.0
+  auto_normalize: false
+
+diffusion:
+  diffusion_steps: 1000
+  sampling_steps: 1000
+  objective: pred_x0
+  beta_schedule: cosine
+  ddim_sampling_eta: 0.0
+
+  # 已经手动缩放至 [-1, 1]，必须关闭库内部的再次归一化。
+  auto_normalize: false
+
+training:
+  device: cuda
+  batch_size: 4
+  number_of_epochs: 2000
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  gradient_clip_norm: 1.0
+
+  number_of_workers: 4
+  pin_memory: true
+  drop_last: false
+
+  use_ema: true
+  ema_decay: 0.995
+  ema_update_every: 10
+
+  validate_every_epochs: 10
+  save_every_epochs: 200
+  log_every_batches: 10
+
+  gradient_accumulation_steps: 1
+  maximum_gradient_norm: 1.0
+  use_mixed_precision: false
+  ema_decay: 0.995
+  ema_update_every: 1
+  maximum_validation_batches: 0
+
+output:
+  output_directory: outputs
+  checkpoint_directory: outputs/checkpoints
+  log_directory: outputs/logs
+  generated_spectrum_directory: outputs/generated_spectra_best_ema
+  preview_plot_directory: outputs/preview_plots
+
+  latest_checkpoint_name: latest.pt
+  best_checkpoint_name: best.pt
+  training_log_name: training_log.csv
+  split_assignment_name: split_assignment.csv
+
+generation:
+  number_of_spectra: 50
+  batch_size: 16
+  use_ema_model: true
+  crop_to_original_length: true
+  inverse_normalize: true
+  output_filename: generated_spectra.xlsx
+  output_formats:
+    - xlsx
+    - csv
+
+outputs:
+  checkpoint_directory: outputs/checkpoints
+  training_log_file: outputs/logs/training_log.csv

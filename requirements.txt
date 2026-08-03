@@ -1,0 +1,18 @@
+# 服务器中已经存在可用的 torch 2.11.0+cu128。
+# 不要在这里重新指定或强制重新安装 torch。
+
+numpy>=1.26
+pandas>=2.1
+scipy>=1.11
+openpyxl>=3.1
+xlrd>=2.0.1
+PyYAML>=6.0
+matplotlib>=3.8
+tqdm>=4.66
+
+einops>=0.8
+accelerate>=1.0
+ema-pytorch>=0.7
+denoising-diffusion-pytorch==2.2.6
+
+pytest>=8.0

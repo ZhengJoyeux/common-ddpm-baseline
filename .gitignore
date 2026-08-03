@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Input data
+data/input/**
+
+# Outputs
+# Outputs
+outputs/checkpoints/
+outputs/generated_spectra*/
+outputs/preview_plots/
+outputs/logs/
+outputs/training_logs/
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+
+# Keep empty directories
+!data/input/.gitkeep
+!outputs/checkpoints/.gitkeep
+!outputs/generated_spectra/.gitkeep
+!outputs/preview_plots/.gitkeep
+!outputs/training_logs/.gitkeep
