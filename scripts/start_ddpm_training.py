@@ -1,11 +1,12 @@
 """Train the unconditional one-dimensional SERS DDPM.
     
     开始训练指令
+    CUDA_VISIBLE_DEVICES=1 \
     python -m scripts.start_ddpm_training \
     --config config/ddpm_training.yaml
 
     生成指令
-    CUDA_VISIBLE_DEVICES=0 \
+    CUDA_VISIBLE_DEVICES=1 \
     python -m scripts.generate_spectra \
     --config config/ddpm_training.yaml \
     --checkpoint outputs/checkpoints/latest.pt \
@@ -13,7 +14,18 @@
 
     监控gpu指令
     watch -n 1 nvidia-smi
+
+    以后添加新模块后，只需：
+
+    git add .
+    git commit -m "D1: add new module"
+    git push
+
+    用git更新代码
+
+
 """
+
 
 from __future__ import annotations
 
@@ -52,6 +64,7 @@ from src.random_seed_manager import (
 )
 from src.spectrum_dataset import SpectrumDataset
 from src.spectrum_file_reader import (
+    SpectrumCollection,
     read_spectrum_collection,
 )
 from src.spectrum_length_adapter import (
@@ -91,12 +104,14 @@ def resolve_device(
         device_text
     ).strip().lower()
 
-    if device_text.startswith("cuda"):
-        if not torch.cuda.is_available():
-            raise RuntimeError(
-                "配置要求使用CUDA，"
-                "但PyTorch未检测到GPU。"
-            )
+    if (
+        device_text.startswith("cuda")
+        and not torch.cuda.is_available()
+    ):
+        raise RuntimeError(
+            "配置要求使用CUDA，"
+            "但PyTorch未检测到GPU。"
+        )
 
     return torch.device(
         device_text
@@ -110,7 +125,7 @@ def validate_split_indices(
     test_indices: np.ndarray,
     number_of_spectra: int,
 ) -> None:
-    """检查三个数据子集是否无重复地覆盖全部光谱。"""
+    """检查三个子集是否非空、无重复并覆盖全部光谱。"""
 
     named_indices = {
         "训练集": training_indices,
@@ -118,7 +133,9 @@ def validate_split_indices(
         "测试集": test_indices,
     }
 
-    for subset_name, indices in named_indices.items():
+    for subset_name, indices in (
+        named_indices.items()
+    ):
         if indices.size == 0:
             raise RuntimeError(
                 f"{subset_name}为空。"
@@ -164,7 +181,7 @@ def validate_split_indices(
 def resolve_training_log_file(
     configuration: dict,
 ) -> Path:
-    """兼容两种训练日志路径写法。"""
+    """兼容训练日志的两种路径写法。"""
 
     output_config = configuration["output"]
 
@@ -191,6 +208,260 @@ def resolve_training_log_file(
     )
 
 
+def build_single_spectrum_overfit_collection(
+    *,
+    collection: SpectrumCollection,
+    diagnostic_config: dict,
+) -> tuple[
+    SpectrumCollection,
+    dict[str, object] | None,
+]:
+    """
+    选择一条真实光谱并在内存中复制。
+
+    该模式只用于检查数据流程、模型和采样能否
+    记住一条固定光谱，不能评价模型泛化能力。
+    """
+
+    enabled = bool(
+        diagnostic_config.get(
+            "enabled",
+            False,
+        )
+    )
+
+    if not enabled:
+        return collection, None
+
+    spectrum_index = int(
+        diagnostic_config.get(
+            "spectrum_index",
+            0,
+        )
+    )
+
+    repeat_count = int(
+        diagnostic_config.get(
+            "repeat_count",
+            50,
+        )
+    )
+
+    original_count = len(
+        collection.spectrum_names
+    )
+
+    if original_count == 0:
+        raise RuntimeError(
+            "原始数据中没有可用于诊断的光谱。"
+        )
+
+    if (
+        spectrum_index < 0
+        or spectrum_index >= original_count
+    ):
+        raise IndexError(
+            "diagnostic_overfit.spectrum_index"
+            "越界："
+            f"当前共有{original_count}条光谱，"
+            f"有效索引为0到"
+            f"{original_count - 1}，"
+            f"但配置值为{spectrum_index}。"
+        )
+
+    if repeat_count < 10:
+        raise ValueError(
+            "diagnostic_overfit.repeat_count"
+            "至少为10，以保证按照"
+            "0.8/0.1/0.1划分后"
+            "三个子集都不为空。"
+        )
+
+    selected_spectrum = np.asarray(
+        collection.spectra[
+            spectrum_index
+        ],
+        dtype=np.float32,
+    ).reshape(-1)
+
+    selected_axis = np.asarray(
+        collection.raman_shifts[
+            spectrum_index
+        ],
+        dtype=np.float64,
+    ).reshape(-1)
+
+    if (
+        selected_spectrum.size
+        != selected_axis.size
+    ):
+        raise RuntimeError(
+            "所选光谱的强度点数与"
+            "拉曼位移点数不一致。"
+        )
+
+    if selected_axis.size < 2:
+        raise RuntimeError(
+            "所选光谱至少需要两个"
+            "拉曼位移点。"
+        )
+
+    if not np.isfinite(
+        selected_spectrum
+    ).all():
+        raise RuntimeError(
+            "所选光谱包含NaN或无穷值。"
+        )
+
+    if not np.isfinite(
+        selected_axis
+    ).all():
+        raise RuntimeError(
+            "所选拉曼位移轴包含"
+            "NaN或无穷值。"
+        )
+
+    if not np.all(
+        np.diff(selected_axis) > 0.0
+    ):
+        raise RuntimeError(
+            "所选拉曼位移轴不是严格递增。"
+        )
+
+    selected_name = str(
+        collection.spectrum_names[
+            spectrum_index
+        ]
+    )
+
+    selected_source_file = (
+        collection.source_files[
+            spectrum_index
+        ]
+    )
+
+    selected_relative_source_file = (
+        collection.relative_source_files[
+            spectrum_index
+        ]
+    )
+
+    selected_label = collection.labels[
+        spectrum_index
+    ]
+
+    repeated_spectra = np.repeat(
+        selected_spectrum[
+            np.newaxis,
+            :,
+        ],
+        repeat_count,
+        axis=0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    repeated_axes = np.repeat(
+        selected_axis[
+            np.newaxis,
+            :,
+        ],
+        repeat_count,
+        axis=0,
+    ).astype(
+        np.float64,
+        copy=False,
+    )
+
+    repeated_collection = SpectrumCollection(
+        raman_shift=selected_axis.copy(),
+        spectra=repeated_spectra,
+        raman_shifts=repeated_axes,
+        original_lengths=np.full(
+            repeat_count,
+            selected_axis.size,
+            dtype=np.int64,
+        ),
+        source_files=np.asarray(
+            [
+                selected_source_file
+                for _ in range(
+                    repeat_count
+                )
+            ],
+            dtype=object,
+        ),
+        relative_source_files=np.asarray(
+            [
+                selected_relative_source_file
+                for _ in range(
+                    repeat_count
+                )
+            ],
+            dtype=object,
+        ),
+        spectrum_names=np.asarray(
+            [
+                (
+                    f"{selected_name}"
+                    f"__repeat_{index + 1:04d}"
+                )
+                for index in range(
+                    repeat_count
+                )
+            ],
+            dtype=object,
+        ),
+        labels=np.asarray(
+            [
+                selected_label
+                for _ in range(
+                    repeat_count
+                )
+            ],
+            dtype=object,
+        ),
+    )
+
+    diagnostic_metadata: dict[
+        str,
+        object,
+    ] = {
+        "enabled": True,
+        "formal_validation": False,
+        "original_number_of_spectra": int(
+            original_count
+        ),
+        "selected_original_index": int(
+            spectrum_index
+        ),
+        "selected_spectrum_name": (
+            selected_name
+        ),
+        "selected_source_file": str(
+            selected_source_file
+        ),
+        "selected_relative_source_file": str(
+            selected_relative_source_file
+        ),
+        "selected_label": str(
+            selected_label
+        ),
+        "selected_original_length": int(
+            selected_axis.size
+        ),
+        "repeat_count": int(
+            repeat_count
+        ),
+    }
+
+    return (
+        repeated_collection,
+        diagnostic_metadata,
+    )
+
+
 def main() -> None:
     """执行完整训练流程。"""
 
@@ -200,7 +471,9 @@ def main() -> None:
         arguments.config
     )
 
-    project_config = configuration["project"]
+    project_config = configuration[
+        "project"
+    ]
 
     random_config = configuration.get(
         "random",
@@ -214,8 +487,26 @@ def main() -> None:
         "normalization"
     ]
 
-    training_config = configuration["training"]
-    output_config = configuration["output"]
+    training_config = configuration[
+        "training"
+    ]
+
+    output_config = configuration[
+        "output"
+    ]
+
+    diagnostic_config = configuration.get(
+        "diagnostic_overfit",
+        {},
+    )
+
+    if not isinstance(
+        diagnostic_config,
+        dict,
+    ):
+        raise TypeError(
+            "diagnostic_overfit必须是字典。"
+        )
 
     random_seed = int(
         random_config.get(
@@ -247,6 +538,42 @@ def main() -> None:
         data_config=data_config,
     )
 
+    (
+        collection,
+        overfit_metadata,
+    ) = (
+        build_single_spectrum_overfit_collection(
+            collection=collection,
+            diagnostic_config=(
+                diagnostic_config
+            ),
+        )
+    )
+
+    if overfit_metadata is not None:
+        if arguments.resume is not None:
+            raise ValueError(
+                "单光谱过拟合诊断必须从头训练，"
+                "不能使用--resume加载旧检查点。"
+            )
+
+        # 只修改内存中的配置，不修改YAML文件。
+        data_config = dict(
+            data_config
+        )
+
+        data_config[
+            "split_unit"
+        ] = "spectrum"
+
+        data_config[
+            "shuffle"
+        ] = False
+
+        configuration[
+            "data"
+        ] = data_config
+
     number_of_spectra = len(
         collection.spectrum_names
     )
@@ -256,15 +583,12 @@ def main() -> None:
             "没有读取到任何光谱。"
         )
 
-    # 必须先完成数据集划分。
     dataset_split = split_spectrum_collection(
         collection=collection,
         data_config=data_config,
         random_seed=random_seed,
     )
 
-    # 直接使用划分器返回的原始索引。
-    # 不再通过source_files反向寻找索引。
     training_indices = np.asarray(
         dataset_split.train.indices,
         dtype=np.int64,
@@ -282,29 +606,39 @@ def main() -> None:
 
     validate_split_indices(
         training_indices=training_indices,
-        validation_indices=validation_indices,
+        validation_indices=(
+            validation_indices
+        ),
         test_indices=test_indices,
-        number_of_spectra=number_of_spectra,
-    )
-
-    # 根据各文件的原始位移轴建立统一训练轴。
-    length_adapter = SpectrumLengthAdapter.create(
-        raman_shifts=collection.raman_shifts,
-        dimension_multipliers=model_config[
-            "dimension_multipliers"
-        ],
-        padding_mode=str(
-            data_config.get(
-                "padding_mode",
-                "right_zero_padding",
-            )
+        number_of_spectra=(
+            number_of_spectra
         ),
     )
 
-    # 把不同长度、不同采样点的光谱
-    # 插值到统一训练轴。
+    # 根据拉曼轴建立统一训练轴。
+    length_adapter = (
+        SpectrumLengthAdapter.create(
+            raman_shifts=(
+                collection.raman_shifts
+            ),
+            dimension_multipliers=(
+                model_config[
+                    "dimension_multipliers"
+                ]
+            ),
+            padding_mode=str(
+                data_config.get(
+                    "padding_mode",
+                    "right_zero_padding",
+                )
+            ),
+        )
+    )
+
+    # 按拉曼位移插值，而不是数组下标。
     spectra_on_model_axis = (
-        length_adapter.interpolate_to_model_axis(
+        length_adapter
+        .interpolate_to_model_axis(
             collection.spectra,
             collection.raman_shifts,
         )
@@ -317,8 +651,10 @@ def main() -> None:
 
     if spectra_on_model_axis.ndim != 2:
         raise RuntimeError(
-            "插值后的光谱必须为二维数组[N, L]，"
-            f"实际为{spectra_on_model_axis.shape}。"
+            "插值后的光谱必须为二维数组"
+            "[N, L]，"
+            f"实际为"
+            f"{spectra_on_model_axis.shape}。"
         )
 
     if (
@@ -336,9 +672,11 @@ def main() -> None:
             "插值后的光谱包含NaN或无穷值。"
         )
 
-    configured_model_length = data_config.get(
-        "model_spectrum_length",
-        "auto",
+    configured_model_length = (
+        data_config.get(
+            "model_spectrum_length",
+            "auto",
+        )
     )
 
     model_length_is_auto = (
@@ -381,15 +719,20 @@ def main() -> None:
         )
     ):
         if (
-            normalization_config.get("method")
+            normalization_config.get(
+                "method"
+            )
             != "global_minmax"
         ):
             raise ValueError(
-                "当前只支持global_minmax归一化。"
+                "当前只支持"
+                "global_minmax归一化。"
             )
 
         if (
-            normalization_config.get("fit_on")
+            normalization_config.get(
+                "fit_on"
+            )
             != "train_only"
         ):
             raise ValueError(
@@ -424,14 +767,14 @@ def main() -> None:
             ),
         )
 
-        # 只使用训练集拟合全局最小值和最大值。
+        # 只使用训练集拟合归一化参数。
         normalizer.fit(
             spectra_on_model_axis[
                 training_indices
             ]
         )
 
-        # 三个数据子集使用同一组训练集参数。
+        # 所有子集使用同一组训练集参数。
         spectra_for_model = (
             normalizer.transform(
                 spectra_on_model_axis
@@ -453,10 +796,11 @@ def main() -> None:
             spectra_on_model_axis.copy()
         )
 
-    # 插值和归一化完成后，
-    # 再在光谱末尾补齐至U-Net要求的长度。
-    padded_spectra = length_adapter.adapt(
-        spectra_for_model
+    # 归一化后再补齐到U-Net要求长度。
+    padded_spectra = (
+        length_adapter.adapt(
+            spectra_for_model
+        )
     )
 
     if not np.isfinite(
@@ -486,7 +830,9 @@ def main() -> None:
     )
 
     device = resolve_device(
-        str(training_config["device"])
+        str(
+            training_config["device"]
+        )
     )
 
     number_of_workers = int(
@@ -501,12 +847,15 @@ def main() -> None:
             "number_of_workers不能小于0。"
         )
 
-    pin_memory = bool(
-        training_config.get(
-            "pin_memory",
-            False,
+    pin_memory = (
+        bool(
+            training_config.get(
+                "pin_memory",
+                False,
+            )
         )
-    ) and device.type == "cuda"
+        and device.type == "cuda"
+    )
 
     batch_size = int(
         training_config["batch_size"]
@@ -529,9 +878,13 @@ def main() -> None:
                 False,
             )
         ),
-        worker_init_fn=seed_data_loader_worker,
-        generator=create_data_loader_generator(
-            random_seed
+        worker_init_fn=(
+            seed_data_loader_worker
+        ),
+        generator=(
+            create_data_loader_generator(
+                random_seed
+            )
         ),
         persistent_workers=(
             number_of_workers > 0
@@ -545,13 +898,14 @@ def main() -> None:
         num_workers=number_of_workers,
         pin_memory=pin_memory,
         drop_last=False,
-        worker_init_fn=seed_data_loader_worker,
+        worker_init_fn=(
+            seed_data_loader_worker
+        ),
         persistent_workers=(
             number_of_workers > 0
         ),
     )
 
-    # 将epoch转换为训练器内部使用的step。
     steps_per_epoch = len(
         training_loader
     )
@@ -563,19 +917,27 @@ def main() -> None:
         )
 
     number_of_epochs = int(
-        training_config["number_of_epochs"]
+        training_config[
+            "number_of_epochs"
+        ]
     )
 
     validate_every_epochs = int(
-        training_config["validate_every_epochs"]
+        training_config[
+            "validate_every_epochs"
+        ]
     )
 
     save_every_epochs = int(
-        training_config["save_every_epochs"]
+        training_config[
+            "save_every_epochs"
+        ]
     )
 
     log_every_batches = int(
-        training_config["log_every_batches"]
+        training_config[
+            "log_every_batches"
+        ]
     )
 
     if number_of_epochs <= 0:
@@ -598,12 +960,16 @@ def main() -> None:
             "log_every_batches必须大于0。"
         )
 
-    training_config["total_training_steps"] = (
+    training_config[
+        "total_training_steps"
+    ] = (
         number_of_epochs
         * steps_per_epoch
     )
 
-    training_config["validate_every_steps"] = (
+    training_config[
+        "validate_every_steps"
+    ] = (
         validate_every_epochs
         * steps_per_epoch
     )
@@ -615,12 +981,10 @@ def main() -> None:
         * steps_per_epoch
     )
 
-    training_config["log_every_steps"] = (
-        log_every_batches
-    )
+    training_config[
+        "log_every_steps"
+    ] = log_every_batches
 
-    # 必须传入完整配置。
-    # 这样model和diffusion两个配置区段都会生效。
     _, diffusion = build_diffusion_model(
         model_configuration=configuration,
         sequence_length=(
@@ -628,13 +992,13 @@ def main() -> None:
         ),
     )
 
-    checkpoint_directory = resolve_project_path(
-        configuration,
-        output_config["checkpoint_directory"],
-    )
-
-    training_log_file = resolve_training_log_file(
-        configuration
+    checkpoint_directory = (
+        resolve_project_path(
+            configuration,
+            output_config[
+                "checkpoint_directory"
+            ],
+        )
     )
 
     checkpoint_manager = CheckpointManager(
@@ -642,35 +1006,48 @@ def main() -> None:
     )
 
     logger = TrainingLogger(
-        training_log_file
+        resolve_training_log_file(
+            configuration
+        )
     )
 
-    # 保存标签、源文件和各自原始位移轴之间的映射。
     axis_metadata = build_axis_metadata(
         labels=collection.labels,
         relative_source_files=(
             collection.relative_source_files
         ),
-        raman_shifts=collection.raman_shifts,
+        raman_shifts=(
+            collection.raman_shifts
+        ),
     )
 
     metadata = {
+        "diagnostic_overfit": (
+            overfit_metadata
+        ),
         "backend_package": (
             "denoising-diffusion-pytorch"
         ),
-        "backend_version": get_backend_version(),
+        "backend_version": (
+            get_backend_version()
+        ),
         "spectrum_names": [
             str(value)
-            for value in collection.spectrum_names
+            for value in (
+                collection.spectrum_names
+            )
         ],
         "source_files": [
             str(value)
-            for value in collection.source_files
+            for value in (
+                collection.source_files
+            )
         ],
         "relative_source_files": [
             str(value)
             for value in (
-                collection.relative_source_files
+                collection
+                .relative_source_files
             )
         ],
         "labels": [
@@ -706,7 +1083,9 @@ def main() -> None:
         device=device,
         configuration=configuration,
         metadata=metadata,
-        checkpoint_manager=checkpoint_manager,
+        checkpoint_manager=(
+            checkpoint_manager
+        ),
         logger=logger,
     )
 
@@ -716,9 +1095,11 @@ def main() -> None:
         ).expanduser()
 
         if not resume_path.is_absolute():
-            resume_path = resolve_project_path(
-                configuration,
-                resume_path,
+            resume_path = (
+                resolve_project_path(
+                    configuration,
+                    resume_path,
+                )
             )
 
         trainer.resume(
@@ -730,7 +1111,9 @@ def main() -> None:
             int(
                 np.asarray(axis).size
             )
-            for axis in collection.raman_shifts
+            for axis in (
+                collection.raman_shifts
+            )
         }
     )
 
@@ -743,71 +1126,141 @@ def main() -> None:
 
     print("\n===== 开始训练 =====")
     print(f"设备：{device}")
+
+    if overfit_metadata is not None:
+        original_spectrum_count = overfit_metadata[
+            "original_number_of_spectra"
+        ]
+        selected_original_index = overfit_metadata[
+            "selected_original_index"
+        ]
+        selected_spectrum_name = overfit_metadata[
+            "selected_spectrum_name"
+        ]
+        selected_source_file = overfit_metadata[
+            "selected_relative_source_file"
+        ]
+        repeat_count = overfit_metadata[
+            "repeat_count"
+        ]
+
+        print(
+            "实验模式："
+            "单条真实光谱重复过拟合诊断"
+        )
+        print(
+            "注意：验证集和测试集也是"
+            "同一条光谱的副本，"
+            "不代表泛化性能。"
+        )
+        print(
+            "原始数据光谱总数："
+            f"{original_spectrum_count}"
+        )
+        print(
+            "所选原始光谱索引："
+            f"{selected_original_index}"
+        )
+        print(
+            "所选原始光谱名称："
+            f"{selected_spectrum_name}"
+        )
+        print(
+            "所选原始源文件："
+            f"{selected_source_file}"
+        )
+        print(
+            "内存复制数量："
+            f"{repeat_count}"
+        )
+
+    label_text = "、".join(labels)
+
     print(
-        f"文件夹标签："
-        f"{'、'.join(labels)}"
+        f"文件夹标签：{label_text}"
     )
     print(
-        f"总光谱数量："
-        f"{number_of_spectra}"
+        f"总光谱数量：{number_of_spectra}"
     )
     print(
-        f"训练光谱数量："
+        "训练光谱数量："
         f"{len(training_dataset)}"
     )
     print(
-        f"验证光谱数量："
+        "验证光谱数量："
         f"{len(validation_dataset)}"
     )
     print(
-        f"测试光谱数量："
+        "测试光谱数量："
         f"{len(test_dataset)}"
     )
+
+    original_length_text = "、".join(
+        str(value)
+        for value in original_lengths
+    )
+
     print(
         "各原始位移轴点数："
-        + "、".join(
-            str(value)
-            for value in original_lengths
-        )
+        f"{original_length_text}"
     )
     print(
-        f"统一训练轴长度："
+        "统一训练轴长度："
         f"{length_adapter.original_length}"
     )
     print(
-        f"模型输入长度："
+        "模型输入长度："
         f"{length_adapter.padded_length}"
     )
     print(
-        f"末尾补齐点数："
+        "末尾补齐点数："
         f"{length_adapter.padding_size}"
     )
     print(
-        f"总训练step："
-        f"{training_config['total_training_steps']}"
+        f"每个epoch的step：{steps_per_epoch}"
+    )
+
+    total_training_steps = training_config[
+        "total_training_steps"
+    ]
+
+    print(
+        f"总训练step：{total_training_steps}"
     )
     print(
-        "平滑、去基线等额外预处理：不执行"
+        "平滑、去基线等额外预处理："
+        "不执行"
     )
 
     if normalizer is not None:
+        normalization_data_min = float(
+            normalizer.data_min
+        )
+        normalization_data_max = float(
+            normalizer.data_max
+        )
+        model_input_min = float(
+            padded_spectra.min()
+        )
+        model_input_max = float(
+            padded_spectra.max()
+        )
+
         print(
-            "强度归一化：训练集global_minmax，"
-            f"映射到["
-            f"{normalizer.target_min:.6g}, "
+            "强度归一化："
+            "训练集global_minmax，"
+            f"映射到[{normalizer.target_min:.6g}, "
             f"{normalizer.target_max:.6g}]"
         )
-
         print(
             "训练集原始强度范围："
-            f"{float(normalizer.data_min):.6g}–"
-            f"{float(normalizer.data_max):.6g}"
+            f"{normalization_data_min:.6g}–"
+            f"{normalization_data_max:.6g}"
         )
-
         print(
             "模型输入范围："
-            f"{float(padded_spectra.min()):.6g}–"
-            f"{float(padded_spectra.max()):.6g}"
+            f"{model_input_min:.6g}–"
+            f"{model_input_max:.6g}"
         )
     else:
         print(
