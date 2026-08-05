@@ -11,11 +11,11 @@
 # ============================================================
 
 project:
-  name: sers_single_spectrum_overfit
+  name: sers_d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000
   random_seed: 2026
 
 diagnostic_overfit:
-  enabled: true
+  enabled: false
 
   # 0表示数据读取顺序中的第一条光谱。
   # 如需选择其他真实光谱，只修改这个索引。
@@ -25,8 +25,8 @@ diagnostic_overfit:
   repeat_count: 50
 
 data:
-  input_directory: data/input
-  recursive: true
+  input_directory: data/input/S001
+  recursive: false
 
   allowed_extensions:
     - .xlsx
@@ -34,7 +34,7 @@ data:
     - .csv
 
   sheet_name: 0
-  header_row: 0
+  header_row: null   #有表头就换成 1 ，没有就换成null
   raman_shift_column: 0
   intensity_start_column: 1
 
@@ -68,6 +68,25 @@ normalization:
   epsilon: 1.0e-12
   save_in_checkpoint: true
 
+prior_residual:
+  # D2先验残差模型开关。
+  enabled: true
+
+  # 只使用训练集计算逐点中位数先验。
+  prior_method: training_pointwise_median
+
+  # 使用可逆稳健分位数asinh残差变换。
+  residual_normalization: robust_asinh
+
+  # 使用训练残差绝对值的99.5%分位数
+  # 表示正常残差的典型范围。
+  residual_quantile: 99.5
+
+  # 训练集最大绝对残差映射到1。
+  target_abs_max: 1.0
+
+  epsilon: 1.0e-8
+
 model:
   channels: 1
   model_dimension: 16
@@ -91,7 +110,7 @@ model:
 
 diffusion:
   diffusion_steps: 100
-  sampling_steps: 100
+  sampling_steps: 50
   objective: pred_x0
   beta_schedule: cosine
   ddim_sampling_eta: 0.0
@@ -99,6 +118,9 @@ diffusion:
   # 已经在项目外部缩放到[-1, 1]，
   # 必须关闭库内部的再次归一化。
   auto_normalize: false
+
+  # D2-B：所有扩散时间步使用相同损失权重。
+  loss_weighting: uniform
 
 training:
   device: cuda
@@ -129,11 +151,11 @@ training:
   maximum_validation_batches: 0
 
 output:
-  output_directory: outputs/diagnostics/single_spectrum_overfit_pred_x0_20000
-  checkpoint_directory: outputs/diagnostics/single_spectrum_overfit_pred_x0_20000/checkpoints
-  log_directory: outputs/diagnostics/single_spectrum_overfit_pred_noise/logs
-  generated_spectrum_directory: outputs/diagnostics/single_spectrum_overfit_pred_noise/generated
-  preview_plot_directory: outputs/diagnostics/single_spectrum_overfit_pred_noise/plots
+  output_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000
+  checkpoint_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/checkpoints
+  log_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/logs
+  generated_spectrum_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/generated/ddim50_ema
+  preview_plot_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/plots
 
   latest_checkpoint_name: latest.pt
   best_checkpoint_name: best.pt

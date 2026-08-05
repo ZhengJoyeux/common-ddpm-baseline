@@ -22,6 +22,9 @@ from src.intensity_normalizer import (
 from src.model_builder import (
     build_diffusion_model,
 )
+from src.prior_residual import (
+    PriorResidualTransformer,
+)
 from src.random_seed_manager import (
     set_random_seed,
 )
@@ -337,6 +340,73 @@ def main() -> None:
             "无法确定训练时的模型结构。"
         )
 
+    # 根据检查点训练配置判断该模型是否启用了D2。
+    # 必须读取检查点内的配置，不能使用当前YAML判断，
+    # 因为当前YAML可能已经被修改。
+    prior_residual_config = (
+        checkpoint_configuration.get(
+            "prior_residual",
+            {},
+        )
+    )
+
+    if prior_residual_config is None:
+        prior_residual_config = {}
+
+    if not isinstance(
+        prior_residual_config,
+        dict,
+    ):
+        raise RuntimeError(
+            "检查点中的prior_residual配置无效。"
+        )
+
+    prior_residual_enabled = bool(
+        prior_residual_config.get(
+            "enabled",
+            False,
+        )
+    )
+
+    prior_residual_transformer = None
+
+    if prior_residual_enabled:
+        prior_residual_state = metadata.get(
+            "prior_residual_state"
+        )
+
+        if not isinstance(
+            prior_residual_state,
+            dict,
+        ):
+            raise RuntimeError(
+                "该检查点启用了D2先验残差模型，"
+                "但metadata中没有有效的"
+                "prior_residual_state。"
+                "请确认该检查点由完整的D2训练流程生成。"
+            )
+
+        try:
+            prior_residual_transformer = (
+                PriorResidualTransformer
+                .from_state_dict(
+                    prior_residual_state
+                )
+            )
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+        ) as error:
+            raise RuntimeError(
+                "检查点中的prior_residual_state"
+                "无法恢复，可能缺少字段或内容损坏。"
+            ) from error
+
+    # D0和D1旧检查点没有prior_residual配置，
+    # 此时prior_residual_transformer保持为None。
+
     # 必须传入检查点中的完整配置，
     # 使model和diffusion两个区段同时生效。
     _, diffusion = build_diffusion_model(
@@ -431,8 +501,9 @@ def main() -> None:
             "generation.batch_size必须大于0。"
         )
 
-    # 生成器先删除模型末尾补齐点，
-    # 然后插值回当前标签的原始位移轴。
+    # 生成器先删除模型末尾补齐点。
+    # D2检查点随后在统一训练轴上恢复完整归一化光谱，
+    # 最后插值回当前标签的原始位移轴。
     spectra = generate_spectra(
         diffusion=diffusion,
         number_of_spectra=number_of_spectra,
@@ -443,6 +514,9 @@ def main() -> None:
         length_adapter=length_adapter,
         output_raman_shifts=(
             output_raman_shifts
+        ),
+        prior_residual_transformer=(
+            prior_residual_transformer
         ),
     )
 
