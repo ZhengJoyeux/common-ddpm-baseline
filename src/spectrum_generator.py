@@ -6,6 +6,9 @@ import numpy as np
 import torch
 from torch import nn
 
+from src.prior_residual import (
+    PriorResidualTransformer,
+)
 from src.spectrum_length_adapter import (
     SpectrumLengthAdapter,
 )
@@ -20,6 +23,9 @@ def generate_spectra(
     device: torch.device,
     length_adapter: SpectrumLengthAdapter,
     output_raman_shifts: np.ndarray | None = None,
+    prior_residual_transformer: (
+        PriorResidualTransformer | None
+    ) = None,
 ) -> np.ndarray:
     """
     分批生成光谱。
@@ -113,6 +119,23 @@ def generate_spectra(
         restored = length_adapter.restore(
             generated_numpy
         )
+
+        # D2：此时数据已经删除末尾补齐点，
+        # 但仍位于统一训练拉曼轴上。
+        # 先取消残差缩放并加回逐点中位数先验，
+        # 再恢复到标签对应的原始拉曼轴。
+        if (
+            prior_residual_transformer
+            is not None
+        ):
+            restored = (
+                prior_residual_transformer
+                .inverse_transform(
+                    restored
+                )
+            )
+
+        # 如果指定了标签或模板文件的原始位移轴，
 
         # 如果指定了标签或模板文件的原始位移轴，
         # 再从统一训练轴插值回该输出轴。

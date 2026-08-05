@@ -54,6 +54,9 @@ from src.intensity_normalizer import (
 from src.model_builder import (
     build_diffusion_model,
 )
+from src.prior_residual import (
+    PriorResidualTransformer,
+)
 from src.one_dimensional_ddpm import (
     get_backend_version,
 )
@@ -796,7 +799,253 @@ def main() -> None:
             spectra_on_model_axis.copy()
         )
 
-    # 归一化后再补齐到U-Net要求长度。
+        # D2：训练集统计先验残差域变换。
+    # 先只使用训练集拟合逐点中位数先验和
+    # 残差范围参数，再用同一状态变换全部子集。
+    prior_residual_config = (
+        configuration.get(
+            "prior_residual",
+            {},
+        )
+    )
+
+    if prior_residual_config is None:
+        prior_residual_config = {}
+
+    if not isinstance(
+        prior_residual_config,
+        dict,
+    ):
+        raise TypeError(
+            "prior_residual配置必须是字典。"
+        )
+
+    prior_residual_state = None
+
+    if bool(
+        prior_residual_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        if normalizer is None:
+            raise ValueError(
+                "启用prior_residual时，"
+                "必须同时启用global_minmax归一化。"
+            )
+
+        if normalization_state is None:
+            raise ValueError(
+                "启用prior_residual时，"
+                "normalization.save_in_checkpoint"
+                "必须设为true。"
+            )
+
+        prior_method = str(
+            prior_residual_config.get(
+                "prior_method",
+                "training_pointwise_median",
+            )
+        ).strip().lower()
+
+        if (
+            prior_method
+            != "training_pointwise_median"
+        ):
+            raise ValueError(
+                "当前D2只支持"
+                "prior_method: "
+                "training_pointwise_median。"
+            )
+
+        residual_normalization = str(
+            prior_residual_config.get(
+                "residual_normalization",
+                "robust_asinh",
+            )
+        ).strip().lower()
+
+        supported_methods = {
+            "global_maxabs",
+            "robust_asinh",
+        }
+
+        if (
+            residual_normalization
+            not in supported_methods
+        ):
+            raise ValueError(
+                "prior_residual."
+                "residual_normalization必须是"
+                "global_maxabs或robust_asinh。"
+            )
+
+        prior_residual_transformer = (
+            PriorResidualTransformer(
+                normalization_method=(
+                    residual_normalization
+                ),
+                target_abs_max=float(
+                    prior_residual_config.get(
+                        "target_abs_max",
+                        1.0,
+                    )
+                ),
+                residual_quantile=float(
+                    prior_residual_config.get(
+                        "residual_quantile",
+                        99.5,
+                    )
+                ),
+                epsilon=float(
+                    prior_residual_config.get(
+                        "epsilon",
+                        1.0e-8,
+                    )
+                ),
+            )
+        )
+
+        # 只用训练集拟合先验和残差范围。
+        prior_residual_transformer.fit(
+            spectra_for_model[
+                training_indices
+            ]
+        )
+
+        # 在覆盖spectra_for_model之前，
+        # 单独统计训练集变换后的残差范围。
+        training_model_residuals = (
+            prior_residual_transformer
+            .transform(
+                spectra_for_model[
+                    training_indices
+                ]
+            )
+        )
+
+        training_absolute_residuals = (
+            np.abs(
+                training_model_residuals
+            )
+        )
+
+        statistics = (
+            prior_residual_transformer
+            .training_abs_residual_percentiles
+            or {}
+        )
+
+        print(
+            "\n===== D2先验残差范围 ====="
+        )
+
+        print(
+            "残差归一化方法："
+            f"{residual_normalization}"
+        )
+
+        print(
+            "训练残差绝对值分位数："
+        )
+
+        for key in (
+            "p50",
+            "p90",
+            "p95",
+            "p99",
+            "p99_5",
+            "p99_9",
+            "max",
+        ):
+            if key in statistics:
+                print(
+                    f"  {key}: "
+                    f"{statistics[key]:.8g}"
+                )
+
+        if (
+            residual_normalization
+            == "robust_asinh"
+        ):
+            print(
+                "稳健尺度分位数："
+                f"{prior_residual_transformer.residual_quantile:g}%"
+            )
+
+            print(
+                "稳健残差尺度："
+                f"{prior_residual_transformer.residual_scale:.8g}"
+            )
+
+            print(
+                "asinh归一化因子："
+                f"{prior_residual_transformer.asinh_normalizer:.8g}"
+            )
+
+        else:
+            print(
+                "线性残差尺度："
+                f"{prior_residual_transformer.residual_scale:.8g}"
+            )
+
+        transformed_percentiles = (
+            np.percentile(
+                training_absolute_residuals,
+                [
+                    50.0,
+                    90.0,
+                    95.0,
+                    99.0,
+                    99.5,
+                    99.9,
+                    100.0,
+                ],
+            )
+        )
+
+        print(
+            "变换后训练残差绝对值分位数："
+        )
+
+        for name, value in zip(
+            (
+                "p50",
+                "p90",
+                "p95",
+                "p99",
+                "p99.5",
+                "p99.9",
+                "max",
+            ),
+            transformed_percentiles,
+            strict=True,
+        ):
+            print(
+                f"  {name}: "
+                f"{float(value):.8g}"
+            )
+
+        print(
+            "==========================\n"
+        )
+
+        # 使用训练集拟合出的同一个变换器
+        # 处理训练集、验证集和测试集。
+        spectra_for_model = (
+            prior_residual_transformer
+            .transform(
+                spectra_for_model
+            )
+        )
+
+        prior_residual_state = (
+            prior_residual_transformer
+            .state_dict()
+        )
+
+    # 完整光谱模式或D2残差模式完成后，
+    # 再补齐到U-Net要求的长度。
     padded_spectra = (
         length_adapter.adapt(
             spectra_for_model
@@ -1071,6 +1320,9 @@ def main() -> None:
         ),
         "normalization_state": (
             normalization_state
+        ),
+        "prior_residual_state": (
+            prior_residual_state
         ),
         "axis_metadata": axis_metadata,
         **length_adapter.to_metadata(),

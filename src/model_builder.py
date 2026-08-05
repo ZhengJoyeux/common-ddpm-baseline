@@ -41,6 +41,17 @@ def build_diffusion_model(
     The function accepts the flat model configuration used by the
     training scripts and tests. It also supports the previous compatible
     key names such as model_dimension and diffusion_steps.
+
+    Supported loss-weighting modes:
+
+    - library_default:
+      Keep the loss weighting defined by the installed diffusion library.
+
+    - snr:
+      Explicitly use the library's SNR weighting for pred_x0.
+
+    - uniform:
+      Give every diffusion timestep the same loss weight of 1.0.
     """
 
     check_backend_version()
@@ -67,6 +78,16 @@ def build_diffusion_model(
         "diffusion",
         model_configuration,
     )
+
+    if not isinstance(architecture_configuration, dict):
+        raise TypeError(
+            "model配置必须是字典。"
+        )
+
+    if not isinstance(diffusion_configuration, dict):
+        raise TypeError(
+            "diffusion配置必须是字典。"
+        )
 
     dimension_multipliers = tuple(
         int(value)
@@ -124,16 +145,23 @@ def build_diffusion_model(
             "channels必须大于0。"
         )
 
+    dropout = float(
+        architecture_configuration.get(
+            "dropout",
+            0.0,
+        )
+    )
+
+    if dropout < 0.0 or dropout >= 1.0:
+        raise ValueError(
+            "dropout必须大于等于0且小于1。"
+        )
+
     unet = Unet1D(
         dim=base_dimension,
         dim_mults=dimension_multipliers,
         channels=channels,
-        dropout=float(
-            architecture_configuration.get(
-                "dropout",
-                0.0,
-            )
-        ),
+        dropout=dropout,
         self_condition=bool(
             architecture_configuration.get(
                 "self_condition",
@@ -174,17 +202,56 @@ def build_diffusion_model(
             "diffusion_timesteps。"
         )
 
+    objective = str(
+        _get_required_value(
+            diffusion_configuration,
+            "objective",
+        )
+    ).strip().lower()
+
+    supported_objectives = {
+        "pred_noise",
+        "pred_x0",
+        "pred_v",
+    }
+
+    if objective not in supported_objectives:
+        raise ValueError(
+            "diffusion.objective必须为"
+            "pred_noise、pred_x0或pred_v。"
+        )
+
+    loss_weighting = str(
+        diffusion_configuration.get(
+            "loss_weighting",
+            "library_default",
+        )
+    ).strip().lower()
+
+    supported_loss_weightings = {
+        "library_default",
+        "snr",
+        "uniform",
+    }
+
+    if loss_weighting not in supported_loss_weightings:
+        raise ValueError(
+            "diffusion.loss_weighting必须为"
+            "library_default、snr或uniform。"
+        )
+
+    if loss_weighting == "snr" and objective != "pred_x0":
+        raise ValueError(
+            "diffusion.loss_weighting=snr目前只允许与"
+            "diffusion.objective=pred_x0配合使用。"
+        )
+
     diffusion_model = GaussianDiffusion1D(
         model=unet,
         seq_length=sequence_length,
         timesteps=diffusion_timesteps,
         sampling_timesteps=sampling_timesteps,
-        objective=str(
-            _get_required_value(
-                diffusion_configuration,
-                "objective",
-            )
-        ),
+        objective=objective,
         beta_schedule=str(
             _get_required_value(
                 diffusion_configuration,
@@ -203,6 +270,23 @@ def build_diffusion_model(
                 True,
             )
         ),
+    )
+
+    # denoising-diffusion-pytorch 2.2.6中：
+    #
+    # pred_noise -> 权重为1
+    # pred_x0    -> 权重为SNR
+    # pred_v     -> 权重为SNR / (SNR + 1)
+    #
+    # uniform模式会在模型创建完成后，将所有扩散时间步的
+    # 损失权重覆盖为1，从而避免pred_x0严重忽略高噪声时间步。
+    if loss_weighting == "uniform":
+        diffusion_model.loss_weight.fill_(1.0)
+
+    # 记录项目配置采用的权重模式。
+    # 该普通属性不会改变第三方库的state_dict结构。
+    diffusion_model.configured_loss_weighting = (
+        loss_weighting
     )
 
     return unet, diffusion_model

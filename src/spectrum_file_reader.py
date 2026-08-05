@@ -67,6 +67,39 @@ def _is_auto(
     )
 
 
+def _parse_header_row(
+    value: Any,
+) -> int | None:
+    """解析Pandas使用的表头行；None表示文件没有表头。"""
+
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+
+        if normalized in {
+            "",
+            "none",
+            "null",
+        }:
+            return None
+
+    try:
+        header_row = int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "data.header_row必须是非负整数或null。"
+        ) from error
+
+    if header_row < 0:
+        raise ValueError(
+            "data.header_row不能小于0。"
+        )
+
+    return header_row
+
+
 def _build_object_array(
     values: list[np.ndarray],
 ) -> np.ndarray:
@@ -141,7 +174,7 @@ def _read_table(
     file_path: str | Path,
     *,
     sheet_name: str | int = 0,
-    header_row: int = 0,
+    header_row: int | None = 0,
     csv_encoding: str = "utf-8-sig",
 ) -> pd.DataFrame:
     path = Path(file_path)
@@ -281,7 +314,7 @@ def read_one_spectrum_file(
             "sheet_name",
             0,
         ),
-        header_row=int(
+        header_row=_parse_header_row(
             data_config.get(
                 "header_row",
                 0,
