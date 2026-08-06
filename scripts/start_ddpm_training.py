@@ -868,6 +868,7 @@ def main() -> None:
         supported_methods = {
             "global_maxabs",
             "robust_asinh",
+            "pointwise_mad_asinh",
         }
 
         if (
@@ -877,7 +878,8 @@ def main() -> None:
             raise ValueError(
                 "prior_residual."
                 "residual_normalization必须是"
-                "global_maxabs或robust_asinh。"
+                "global_maxabs、robust_asinh或"
+                "pointwise_mad_asinh。"
             )
 
         prior_residual_transformer = (
@@ -895,6 +897,18 @@ def main() -> None:
                     prior_residual_config.get(
                         "residual_quantile",
                         99.5,
+                    )
+                ),
+                pointwise_scale_floor_quantile=float(
+                    prior_residual_config.get(
+                        "pointwise_scale_floor_quantile",
+                        10.0,
+                    )
+                ),
+                mad_scale_factor=float(
+                    prior_residual_config.get(
+                        "mad_scale_factor",
+                        1.4826,
                     )
                 ),
                 epsilon=float(
@@ -976,6 +990,70 @@ def main() -> None:
             print(
                 "稳健残差尺度："
                 f"{prior_residual_transformer.residual_scale:.8g}"
+            )
+
+            print(
+                "asinh归一化因子："
+                f"{prior_residual_transformer.asinh_normalizer:.8g}"
+            )
+
+        elif (
+            residual_normalization
+            == "pointwise_mad_asinh"
+        ):
+            print(
+                "逐波数MAD换算系数："
+                f"{prior_residual_transformer.mad_scale_factor:.8g}"
+            )
+
+            print(
+                "逐波数尺度下限分位数："
+                f"{prior_residual_transformer.pointwise_scale_floor_quantile:g}%"
+            )
+
+            print(
+                "逐波数尺度下限："
+                f"{prior_residual_transformer.pointwise_scale_floor:.8g}"
+            )
+
+            print(
+                "逐波数尺度分位数："
+            )
+
+            pointwise_statistics = (
+                prior_residual_transformer
+                .training_pointwise_scale_percentiles
+                or {}
+            )
+
+            for key in (
+                "p50",
+                "p90",
+                "p95",
+                "p99",
+                "p99_5",
+                "p99_9",
+                "max",
+            ):
+                if key in pointwise_statistics:
+                    print(
+                        f"  {key}: "
+                        f"{pointwise_statistics[key]:.8g}"
+                    )
+
+            print(
+                "标准化残差稳健分位数："
+                f"{prior_residual_transformer.residual_quantile:g}%"
+            )
+
+            print(
+                "标准化残差尺度："
+                f"{prior_residual_transformer.residual_scale:.8g}"
+            )
+
+            print(
+                "标准化残差最大绝对值："
+                f"{prior_residual_transformer.training_max_abs_standardized_residual:.8g}"
             )
 
             print(

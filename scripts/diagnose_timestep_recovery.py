@@ -1099,9 +1099,32 @@ def main() -> None:
     if prior_transformer is not None:
         print("D2先验残差支持：已启用")
         print(
-            "残差缩放系数："
-            f"{prior_transformer.residual_scale:.8f}"
+            "残差归一化方法："
+            f"{prior_transformer.normalization_method}"
         )
+
+        if (
+            prior_transformer.normalization_method
+            == "pointwise_mad_asinh"
+        ):
+            print(
+                "逐波数尺度下限："
+                f"{prior_transformer.pointwise_scale_floor:.8f}"
+            )
+            print(
+                "逐波数尺度中位数："
+                f"{np.median(prior_transformer.pointwise_scale):.8f}"
+            )
+            print(
+                "标准化残差尺度："
+                f"{prior_transformer.residual_scale:.8f}"
+            )
+        else:
+            print(
+                "残差缩放系数："
+                f"{prior_transformer.residual_scale:.8f}"
+            )
+
         print(
             "仅先验Pearson："
             f"{prior_only_pearson:.6f}"

@@ -1,17 +1,17 @@
 # ============================================================
-# D0普通无条件一维DDPM：单条真实光谱重复过拟合诊断
+# D2.1逐波数MAD–asinh先验残差扩散实验
 #
 # 目的：
-# 检查模型、采样、归一化和拉曼轴恢复流程能否
-# 记住一条固定的真实SERS光谱。
+# 只改变D2残差标准化方式：由全局标量尺度改为
+# 训练集逐波数稳健尺度，抑制安静区随机伪峰和异常负峰。
 #
 # 注意：
-# 该模式不是正式的数据增强实验。
-# 复制得到的validation/test不能评价模型泛化能力。
+# prior、逐波数尺度、尺度下限和asinh参数
+# 全部只能使用训练集拟合。
 # ============================================================
 
 project:
-  name: sers_d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000
+  name: sers_d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000
   random_seed: 2026
 
 diagnostic_overfit:
@@ -75,14 +75,21 @@ prior_residual:
   # 只使用训练集计算逐点中位数先验。
   prior_method: training_pointwise_median
 
-  # 使用可逆稳健分位数asinh残差变换。
-  residual_normalization: robust_asinh
+  # D2.1：逐波数MAD稳健尺度 + 可逆asinh变换。
+  residual_normalization: pointwise_mad_asinh
 
-  # 使用训练残差绝对值的99.5%分位数
-  # 表示正常残差的典型范围。
+  # 先除以逐波数尺度，再使用标准化残差绝对值的
+  # 99.5%分位数表示正常标准化残差范围。
   residual_quantile: 99.5
 
-  # 训练集最大绝对残差映射到1。
+  # 原始逐波数尺度为1.4826 * MAD。
+  mad_scale_factor: 1.4826
+
+  # 用所有非零逐波数尺度的第10百分位作为下限，
+  # 防止近零MAD引起除零和数值不稳定。
+  pointwise_scale_floor_quantile: 10.0
+
+  # 训练集最大绝对标准化残差映射到1。
   target_abs_max: 1.0
 
   epsilon: 1.0e-8
@@ -126,9 +133,9 @@ training:
   device: cuda
   batch_size: 8
 
-  # 40条训练副本，batch_size为8，
-  # 因此每个epoch为5个step。
-  # 1000个epoch共5000个step。
+  # 当前正式划分有42条训练光谱，batch_size为8且
+  # drop_last=false，因此每个epoch为6个step。
+  # 4000个epoch约为24000个优化step。
   number_of_epochs: 4000
 
   learning_rate: 0.0001
@@ -151,11 +158,11 @@ training:
   maximum_validation_batches: 0
 
 output:
-  output_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000
-  checkpoint_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/checkpoints
-  log_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/logs
-  generated_spectrum_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/generated/ddim50_ema
-  preview_plot_directory: outputs/experiments/d2_prior_residual_pred_x0_robust_asinh_uniform_s001_24000/plots
+  output_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000
+  checkpoint_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/checkpoints
+  log_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/logs
+  generated_spectrum_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/generated/ddim50_ema
+  preview_plot_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/plots
 
   latest_checkpoint_name: latest.pt
   best_checkpoint_name: best.pt
