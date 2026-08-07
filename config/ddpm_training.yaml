@@ -1,32 +1,17 @@
-# ============================================================
-# D2.1逐波数MAD–asinh先验残差扩散实验
-#
-# 目的：
-# 只改变D2残差标准化方式：由全局标量尺度改为
-# 训练集逐波数稳健尺度，抑制安静区随机伪峰和异常负峰。
-#
-# 注意：
-# prior、逐波数尺度、尺度下限和asinh参数
-# 全部只能使用训练集拟合。
-# ============================================================
-
 project:
-  name: sers_d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000
+  name: sers_d3_2_relaxed_shape_s001_safety_1200
   random_seed: 2026
+
 
 diagnostic_overfit:
   enabled: false
-
-  # 0表示数据读取顺序中的第一条光谱。
-  # 如需选择其他真实光谱，只修改这个索引。
   spectrum_index: 0
-
-  # 复制50份后按照0.8/0.1/0.1分成40/5/5。
   repeat_count: 50
 
+
 data:
-  input_directory: data/input/S001
-  recursive: false
+  input_directory: data/input
+  recursive: true
 
   allowed_extensions:
     - .xlsx
@@ -34,7 +19,7 @@ data:
     - .csv
 
   sheet_name: 0
-  header_row: null   #有表头就换成 1 ，没有就换成null
+  header_row: null
   raman_shift_column: 0
   intensity_start_column: 1
 
@@ -44,55 +29,184 @@ data:
 
   original_spectrum_length: auto
   model_spectrum_length: auto
-
   length_adaptation: raman_axis_interpolation
+
   padding_mode: right_zero_padding
   padding_value: 0.0
 
-  # 正常模式仍然按源文件划分。
-  # 诊断模式开启后，训练入口只在内存中
-  # 临时修改为split_unit: spectrum。
-  split_unit: source_file
+  # 每个样品条件文件夹内部独立划分。
+  # 每个CSV必须只包含一条光谱。
+  split_unit: spectrum_within_folder
   train_ratio: 0.8
   validation_ratio: 0.1
   test_ratio: 0.1
   shuffle: true
 
+
 normalization:
   enabled: true
   method: global_minmax
   fit_on: train_only
+
   target_min: -1.0
   target_max: 1.0
   clip: false
   epsilon: 1.0e-12
+
   save_in_checkpoint: true
 
+
 prior_residual:
-  # D2先验残差模型开关。
   enabled: true
-
-  # 只使用训练集计算逐点中位数先验。
   prior_method: training_pointwise_median
-
-  # D2.1：逐波数MAD稳健尺度 + 可逆asinh变换。
   residual_normalization: pointwise_mad_asinh
 
-  # 先除以逐波数尺度，再使用标准化残差绝对值的
-  # 99.5%分位数表示正常标准化残差范围。
   residual_quantile: 99.5
-
-  # 原始逐波数尺度为1.4826 * MAD。
   mad_scale_factor: 1.4826
-
-  # 用所有非零逐波数尺度的第10百分位作为下限，
-  # 防止近零MAD引起除零和数值不稳定。
   pointwise_scale_floor_quantile: 10.0
-
-  # 训练集最大绝对标准化残差映射到1。
   target_abs_max: 1.0
-
   epsilon: 1.0e-8
+
+
+physics_constraints:
+  enabled: true
+  strategy: target_adaptive_peak_morphology
+
+  # D3.2改变了损失定义，不能从D3.1 checkpoint使用--resume。
+  # D3.2-R放宽整体物理损失权重，避免物理约束压制生成多样性。
+  total_weight: 0.01
+  calculation_domain: restored_global_minmax_normalized_spectrum
+
+  inverse_transform:
+    # 只用于防止torch.sinh数值溢出。
+    # 正常训练残差远低于该值；真正的异常由scaled_residual_guard约束。
+    numerical_safety_limit: 15.0
+
+  timestep_weighting:
+    # 精确峰形在高噪声时间步仍降低权重。
+    mode: sqrt_alpha_cumprod
+    minimum_weight: 0.05
+
+    # 深负谷、尖峰、越界和残差爆炸在高噪声阶段也不能放任。
+    pathology_minimum_weight: 0.50
+
+  peak_detection:
+    # 仅定义自动找峰规则，不是固定特征峰位置。
+    smoothing_sigma_cm1: 2.0
+    local_maximum_radius_cm1: 4.0
+    prominence_radius_cm1: 12.0
+    minimum_peak_separation_cm1: 10.0
+
+    analysis_half_width_cm1: 20.0
+    maximum_peaks_per_spectrum: 12
+
+    minimum_relative_prominence: 0.08
+    minimum_prominence_noise_multiplier: 4.0
+    training_prominence_floor_quantile: 25.0
+    minimum_absolute_prominence: 1.0e-4
+
+    # 必须不小于analysis_half_width_cm1。
+    edge_exclusion_cm1: 24.0
+    positive_softplus_temperature: 0.01
+    epsilon: 1.0e-8
+
+  peak_position:
+    zero_penalty_tolerance_cm1: 5.0
+    transition_width_cm1: 5.0
+
+  peak_width:
+    narrow_relative_tolerance: 0.30
+    broad_relative_tolerance: 0.50
+    absolute_tolerance_cm1: 1.5
+    transition_fraction: 0.25
+
+    # D3.2加强过窄峰惩罚。
+    narrow_penalty_multiplier: 2.5
+    broad_penalty_multiplier: 0.5
+
+  peak_sharpness:
+    upper_relative_tolerance: 0.25
+    transition_fraction: 0.20
+
+  peak_presence:
+    minimum_area_ratio: 0.45
+    transition_fraction: 0.25
+
+  local_shape:
+    # 保留局部峰形统计参数，但D3.2-R不再逐点复制目标峰轮廓。
+    profile_tolerance: 0.10
+    first_derivative_tolerance: 0.25
+    second_derivative_tolerance: 0.30
+
+    # 对目标峰中心左侧下降、右侧上升等额外转折进行惩罚。
+    unimodality_tolerance: 0.05
+    total_variation_tolerance: 0.20
+    target_support_fraction: 0.08
+    transition_fraction: 0.20
+
+    # D3.2-R关闭逐点轮廓和导数目标复制，
+    # 允许特征峰在合理范围内发生峰位和峰强变化。
+    profile_weight: 0.0
+    first_derivative_weight: 0.0
+    second_derivative_weight: 0.0
+
+    # 仍保留单峰性和总变差约束，防止峰分裂和剧烈振荡。
+    unimodality_weight: 2.0
+    total_variation_weight: 1.0
+
+  negative_valley:
+    # 直接针对“真实峰位置生成深负谷”。
+    enabled: true
+    noise_margin_multiplier: 4.0
+    minimum_margin_fraction: 0.02
+    center_weight_sigma_fraction: 0.40
+    transition_fraction: 0.20
+    weight_within_extreme: 2.0
+
+  pathology_aggregation:
+    # 不再只对1901个点取平均；同时关注最严重1%的点。
+    mean_weight: 0.50
+    topk_weight: 0.50
+    topk_fraction: 0.01
+
+  roughness:
+    first_derivative_quantile: 99.5
+    second_derivative_quantile: 99.5
+    limit_multiplier: 1.15
+
+    first_transition_fraction: 0.20
+    second_transition_fraction: 0.20
+    first_derivative_weight: 1.0
+    second_derivative_weight: 1.5
+
+  pointwise_envelope:
+    enabled: true
+    lower_quantile: 1.0
+    upper_quantile: 99.0
+    mad_margin_multiplier: 3.0
+    transition_fraction: 0.20
+
+  extreme_intensity:
+    lower_margin_fraction: 0.03
+    upper_margin_fraction: 0.03
+    transition_fraction: 0.08
+
+  scaled_residual_guard:
+    enabled: true
+    absolute_quantile: 99.5
+    limit_multiplier: 1.10
+    transition_fraction: 0.15
+
+  component_weights:
+    position: 1.0
+    width: 1.5
+    sharpness: 1.5
+    presence: 0.75
+    local_shape: 1.0
+    roughness: 2.0
+    extreme: 3.0
+    scaled_residual_guard: 1.5
+
 
 model:
   channels: 1
@@ -106,8 +220,6 @@ model:
   dropout: 0.0
   self_condition: false
 
-  # 保留兼容字段。
-  # 实际扩散参数由下面的diffusion区段读取。
   diffusion_timesteps: 100
   sampling_timesteps: 100
   objective: pred_x0
@@ -115,67 +227,72 @@ model:
   ddim_sampling_eta: 0.0
   auto_normalize: false
 
+
 diffusion:
   diffusion_steps: 100
   sampling_steps: 50
   objective: pred_x0
   beta_schedule: cosine
   ddim_sampling_eta: 0.0
-
-  # 已经在项目外部缩放到[-1, 1]，
-  # 必须关闭库内部的再次归一化。
   auto_normalize: false
-
-  # D2-B：所有扩散时间步使用相同损失权重。
   loss_weighting: uniform
+
 
 training:
   device: cuda
-  batch_size: 8
 
-  # 当前正式划分有42条训练光谱，batch_size为8且
-  # drop_last=false，因此每个epoch为6个step。
-  # 4000个epoch约为24000个优化step。
-  number_of_epochs: 4000
+  # 轻量提速：增加单次送入GPU的光谱数量。
+  batch_size: 16
+
+  # S001训练集42条、batch_size=16时，每epoch约3 step。
+  # 400 epoch约等于1200 step，与原batch_size=8、200 epoch接近。
+  number_of_epochs: 400
 
   learning_rate: 0.0001
   weight_decay: 0.0
 
+  # 数据已在训练开始前载入内存，当前小数据集保持0更合适。
   number_of_workers: 0
   pin_memory: true
   drop_last: false
 
-  validate_every_epochs: 10
-  save_every_epochs: 100
-  log_every_batches: 10
+  # 约每150 step验证一次。
+  validate_every_epochs: 50
+
+  # 约每600 step保存一次阶段checkpoint。
+  save_every_epochs: 200
+
+  # 每20个优化器step记录一次训练日志。
+  log_every_batches: 20
 
   gradient_accumulation_steps: 1
   maximum_gradient_norm: 1.0
+
+  # 暂不启用FP16，避免sinh、导数和峰宽计算出现数值问题。
   use_mixed_precision: false
 
   ema_decay: 0.995
   ema_update_every: 1
   maximum_validation_batches: 0
 
+
 output:
-  output_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000
-  checkpoint_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/checkpoints
-  log_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/logs
-  generated_spectrum_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/generated/ddim50_ema
-  preview_plot_directory: outputs/experiments/d2_1_pointwise_mad_asinh_pred_x0_uniform_s001_24000/plots
+  output_directory: outputs/experiments/d3_2_relaxed_shape_s001_safety_1200
+  checkpoint_directory: outputs/experiments/d3_2_relaxed_shape_s001_safety_1200/checkpoints
+  log_directory: outputs/experiments/d3_2_relaxed_shape_s001_safety_1200/logs
+  generated_spectrum_directory: outputs/experiments/d3_2_relaxed_shape_s001_safety_1200/generated/ddim50_ema
+  preview_plot_directory: outputs/experiments/d3_2_relaxed_shape_s001_safety_1200/plots
 
   latest_checkpoint_name: latest.pt
   best_checkpoint_name: best.pt
   training_log_name: training_log.csv
   split_assignment_name: split_assignment.csv
 
+
 generation:
   number_of_spectra: 20
   batch_size: 10
-
-  # 可以被命令行中的
-  # --model-source raw或ema覆盖。
-  model_source: raw
+  model_source: ema
 
   crop_to_original_length: true
   inverse_normalize: true

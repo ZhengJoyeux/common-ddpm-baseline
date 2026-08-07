@@ -1,4 +1,6 @@
-"""Custom trainer for unconditional one-dimensional SERS DDPM."""
+"""D0-D3.2 一维 SERS DDPM 的训练、验证、EMA 和 checkpoint 管理。"""
+
+from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
@@ -18,7 +20,7 @@ from src.training_logger import TrainingLogger
 
 
 class ExponentialMovingAverage:
-    """Maintain an exponential moving average of model parameters."""
+    """维护扩散模型参数和缓冲区的指数移动平均。"""
 
     def __init__(
         self,
@@ -50,6 +52,7 @@ class ExponentialMovingAverage:
         for ema_parameter, model_parameter in zip(
             self.ema_model.parameters(),
             model.parameters(),
+            strict=True,
         ):
             ema_parameter.lerp_(
                 model_parameter.detach(),
@@ -59,6 +62,7 @@ class ExponentialMovingAverage:
         for ema_buffer, model_buffer in zip(
             self.ema_model.buffers(),
             model.buffers(),
+            strict=True,
         ):
             ema_buffer.copy_(model_buffer)
 
@@ -78,8 +82,6 @@ class ExponentialMovingAverage:
 
 
 def _create_gradient_scaler(enabled: bool):
-    """Create GradScaler across different PyTorch versions."""
-
     try:
         return torch.amp.GradScaler(
             "cuda",
@@ -90,7 +92,13 @@ def _create_gradient_scaler(enabled: bool):
 
 
 class DdpmTrainer:
-    """Train, validate and checkpoint a one-dimensional DDPM."""
+    """
+    执行按 step 计数的一维 DDPM 训练与验证。
+
+    D3.2 性能改动：训练分项损失先以 detached GPU tensor 累计，只在
+    真正写日志或完成验证时一次性转换为 Python float，避免每个 step
+    对十几个分项逐一调用 ``.item()`` 导致 GPU/CPU 强制同步。
+    """
 
     def __init__(
         self,
@@ -113,74 +121,56 @@ class DdpmTrainer:
         self.checkpoint_manager = checkpoint_manager
         self.logger = logger
 
-        training_config = configuration["training"]
-
+        training = configuration["training"]
         self.total_training_steps = int(
-            training_config["total_training_steps"]
+            training["total_training_steps"]
         )
         self.gradient_accumulation_steps = int(
-            training_config["gradient_accumulation_steps"]
+            training["gradient_accumulation_steps"]
         )
         self.maximum_gradient_norm = float(
-            training_config["maximum_gradient_norm"]
+            training["maximum_gradient_norm"]
         )
-
-        self.log_every_steps = int(
-            training_config["log_every_steps"]
-        )
+        self.log_every_steps = int(training["log_every_steps"])
         self.validate_every_steps = int(
-            training_config["validate_every_steps"]
+            training["validate_every_steps"]
         )
         self.checkpoint_every_steps = int(
-            training_config["checkpoint_every_steps"]
+            training["checkpoint_every_steps"]
         )
         self.maximum_validation_batches = int(
-            training_config.get(
-                "maximum_validation_batches",
-                0,
-            )
+            training.get("maximum_validation_batches", 0)
         )
 
         self.optimizer = AdamW(
             self.diffusion.parameters(),
-            lr=float(training_config["learning_rate"]),
-            weight_decay=float(
-                training_config.get("weight_decay", 0.0)
-            ),
+            lr=float(training["learning_rate"]),
+            weight_decay=float(training.get("weight_decay", 0.0)),
         )
-
-        self.use_mixed_precision = bool(
-            training_config["use_mixed_precision"]
-        ) and device.type == "cuda"
-
+        self.use_mixed_precision = (
+            bool(training["use_mixed_precision"])
+            and device.type == "cuda"
+        )
         self.gradient_scaler = _create_gradient_scaler(
             self.use_mixed_precision
         )
-
         self.ema = ExponentialMovingAverage(
             model=self.diffusion,
-            decay=float(training_config["ema_decay"]),
-            update_every=int(
-                training_config["ema_update_every"]
-            ),
+            decay=float(training["ema_decay"]),
+            update_every=int(training["ema_update_every"]),
         )
 
         self.starting_step = 0
         self.best_validation_loss = float("inf")
         self._training_iterator: Iterable | None = None
+        self.latest_validation_components: dict[str, float] | None = None
 
     def resume(self, checkpoint_path: str | Path) -> None:
-        """Restore all available training states."""
-
         checkpoint = load_checkpoint_file(
             checkpoint_path,
             map_location=self.device,
         )
-
-        self.diffusion.load_state_dict(
-            checkpoint["diffusion_state"]
-        )
-
+        self.diffusion.load_state_dict(checkpoint["diffusion_state"])
         ema_state = checkpoint.get("ema_state")
 
         if ema_state:
@@ -198,9 +188,7 @@ class DdpmTrainer:
         scaler_state = checkpoint.get("scaler_state")
 
         if scaler_state:
-            self.gradient_scaler.load_state_dict(
-                scaler_state
-            )
+            self.gradient_scaler.load_state_dict(scaler_state)
 
         self.starting_step = int(checkpoint.get("step", 0))
         self.best_validation_loss = float(
@@ -212,22 +200,17 @@ class DdpmTrainer:
 
         print(
             f"从step={self.starting_step}继续训练，"
-            f"历史最佳验证损失="
-            f"{self.best_validation_loss:.6f}"
+            f"历史最佳验证损失={self.best_validation_loss:.6f}"
         )
 
     def _next_training_batch(self) -> torch.Tensor:
         if self._training_iterator is None:
-            self._training_iterator = iter(
-                self.training_loader
-            )
+            self._training_iterator = iter(self.training_loader)
 
         try:
             batch = next(self._training_iterator)
         except StopIteration:
-            self._training_iterator = iter(
-                self.training_loader
-            )
+            self._training_iterator = iter(self.training_loader)
             batch = next(self._training_iterator)
 
         if isinstance(batch, (tuple, list)):
@@ -238,21 +221,95 @@ class DdpmTrainer:
             non_blocking=True,
         )
 
+    def _read_loss_components(
+        self,
+        total_loss: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        getter = getattr(
+            self.diffusion,
+            "get_latest_loss_components",
+            None,
+        )
+
+        if not callable(getter):
+            scalar = total_loss.detach()
+
+            return {
+                "total_loss": scalar,
+                "ddpm_loss": scalar,
+                "physics_loss": torch.zeros_like(scalar),
+            }
+
+        raw_components = getter()
+
+        if not isinstance(raw_components, dict):
+            raise RuntimeError(
+                "get_latest_loss_components必须返回字典。"
+            )
+
+        converted: dict[str, torch.Tensor] = {}
+
+        for name, value in raw_components.items():
+            if torch.is_tensor(value):
+                converted[name] = value.detach()
+            else:
+                converted[name] = torch.as_tensor(
+                    value,
+                    device=self.device,
+                    dtype=total_loss.dtype,
+                )
+
+        return converted
+
+    @staticmethod
+    def _accumulate_components(
+        destination: dict[str, torch.Tensor],
+        source: dict[str, torch.Tensor],
+        *,
+        scale: float = 1.0,
+    ) -> None:
+        for name, value in source.items():
+            scaled = value.detach() * float(scale)
+
+            if name in destination:
+                destination[name] = destination[name] + scaled
+            else:
+                destination[name] = scaled.clone()
+
+    @staticmethod
+    def _average_components_to_float(
+        accumulated: dict[str, torch.Tensor],
+        count: int,
+    ) -> dict[str, float]:
+        if count <= 0:
+            return {}
+
+        names = list(accumulated)
+
+        if not names:
+            return {}
+
+        # 把所有分项拼接后只进行一次GPU到CPU同步。
+        stacked = torch.stack(
+            [accumulated[name] / count for name in names]
+        ).detach().cpu()
+
+        return {
+            name: float(stacked[index])
+            for index, name in enumerate(names)
+        }
+
     @torch.no_grad()
     def validate(self) -> float:
-        """Calculate mean stochastic DDPM validation loss."""
-
         self.diffusion.eval()
+        accumulated_loss: torch.Tensor | None = None
+        accumulated_components: dict[str, torch.Tensor] = {}
+        number_of_batches = 0
 
-        losses: list[float] = []
-
-        for batch_index, batch in enumerate(
-            self.validation_loader
-        ):
+        for batch_index, batch in enumerate(self.validation_loader):
             if (
                 self.maximum_validation_batches > 0
-                and batch_index
-                >= self.maximum_validation_batches
+                and batch_index >= self.maximum_validation_batches
             ):
                 break
 
@@ -271,14 +328,34 @@ class DdpmTrainer:
             ):
                 loss = self.diffusion(batch)
 
-            losses.append(float(loss.detach().item()))
+            detached_loss = loss.detach()
+            accumulated_loss = (
+                detached_loss.clone()
+                if accumulated_loss is None
+                else accumulated_loss + detached_loss
+            )
+            self._accumulate_components(
+                accumulated_components,
+                self._read_loss_components(loss),
+            )
+            number_of_batches += 1
 
         self.diffusion.train()
 
-        if not losses:
+        if number_of_batches == 0 or accumulated_loss is None:
             raise RuntimeError("验证集没有产生任何批次。")
 
-        return sum(losses) / len(losses)
+        validation_loss = float(
+            (accumulated_loss / number_of_batches).detach().cpu()
+        )
+        self.latest_validation_components = (
+            self._average_components_to_float(
+                accumulated_components,
+                number_of_batches,
+            )
+        )
+
+        return validation_loss
 
     def _save_checkpoint(
         self,
@@ -301,18 +378,16 @@ class DdpmTrainer:
         )
 
     def train(self) -> None:
-        """Run step-based DDPM training."""
-
         if self.starting_step >= self.total_training_steps:
             print(
-                "检查点的训练步数已经达到或超过"
+                "检查点训练步数已经达到或超过"
                 "total_training_steps，无需继续训练。"
             )
             return
 
         self.diffusion.train()
-
-        accumulated_log_loss = 0.0
+        accumulated_log_loss: torch.Tensor | None = None
+        accumulated_log_components: dict[str, torch.Tensor] = {}
         number_of_logged_steps = 0
         latest_validation_loss: float | None = None
 
@@ -321,12 +396,10 @@ class DdpmTrainer:
             self.total_training_steps + 1,
         ):
             self.optimizer.zero_grad(set_to_none=True)
+            step_loss: torch.Tensor | None = None
+            step_components: dict[str, torch.Tensor] = {}
 
-            step_loss = 0.0
-
-            for _ in range(
-                self.gradient_accumulation_steps
-            ):
+            for _ in range(self.gradient_accumulation_steps):
                 batch = self._next_training_batch()
 
                 with torch.autocast(
@@ -336,33 +409,47 @@ class DdpmTrainer:
                 ):
                     loss = self.diffusion(batch)
                     backward_loss = (
-                        loss
-                        / self.gradient_accumulation_steps
+                        loss / self.gradient_accumulation_steps
                     )
 
-                self.gradient_scaler.scale(
-                    backward_loss
-                ).backward()
+                self.gradient_scaler.scale(backward_loss).backward()
+                detached_loss = (
+                    loss.detach() / self.gradient_accumulation_steps
+                )
+                step_loss = (
+                    detached_loss.clone()
+                    if step_loss is None
+                    else step_loss + detached_loss
+                )
+                self._accumulate_components(
+                    step_components,
+                    self._read_loss_components(loss),
+                    scale=(
+                        1.0 / self.gradient_accumulation_steps
+                    ),
+                )
 
-                step_loss += float(loss.detach().item())
+            if step_loss is None:
+                raise RuntimeError("训练step没有产生损失。")
 
-            step_loss /= self.gradient_accumulation_steps
-
-            self.gradient_scaler.unscale_(
-                self.optimizer
-            )
-
+            self.gradient_scaler.unscale_(self.optimizer)
             clip_grad_norm_(
                 self.diffusion.parameters(),
                 self.maximum_gradient_norm,
             )
-
             self.gradient_scaler.step(self.optimizer)
             self.gradient_scaler.update()
-
             self.ema.update(self.diffusion)
 
-            accumulated_log_loss += step_loss
+            accumulated_log_loss = (
+                step_loss.clone()
+                if accumulated_log_loss is None
+                else accumulated_log_loss + step_loss
+            )
+            self._accumulate_components(
+                accumulated_log_components,
+                step_components,
+            )
             number_of_logged_steps += 1
 
             should_validate = (
@@ -373,14 +460,8 @@ class DdpmTrainer:
             if should_validate:
                 latest_validation_loss = self.validate()
 
-                if (
-                    latest_validation_loss
-                    < self.best_validation_loss
-                ):
-                    self.best_validation_loss = (
-                        latest_validation_loss
-                    )
-
+                if latest_validation_loss < self.best_validation_loss:
+                    self.best_validation_loss = latest_validation_loss
                     self._save_checkpoint(
                         step=step,
                         file_name="best.pt",
@@ -393,23 +474,38 @@ class DdpmTrainer:
             )
 
             if should_log:
-                average_training_loss = (
-                    accumulated_log_loss
-                    / number_of_logged_steps
-                )
+                if accumulated_log_loss is None:
+                    raise RuntimeError("日志区间没有累计训练损失。")
 
-                learning_rate = self.optimizer.param_groups[
-                    0
-                ]["lr"]
+                average_training_loss = float(
+                    (
+                        accumulated_log_loss
+                        / number_of_logged_steps
+                    )
+                    .detach()
+                    .cpu()
+                )
+                average_training_components = (
+                    self._average_components_to_float(
+                        accumulated_log_components,
+                        number_of_logged_steps,
+                    )
+                )
+                learning_rate = self.optimizer.param_groups[0]["lr"]
 
                 self.logger.record(
                     step=step,
                     training_loss=average_training_loss,
                     validation_loss=latest_validation_loss,
                     learning_rate=learning_rate,
+                    training_components=average_training_components,
+                    validation_components=(
+                        self.latest_validation_components
+                    ),
                 )
 
-                accumulated_log_loss = 0.0
+                accumulated_log_loss = None
+                accumulated_log_components = {}
                 number_of_logged_steps = 0
 
             should_checkpoint = (

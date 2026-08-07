@@ -1,4 +1,4 @@
-"""Build the one-dimensional U-Net and DDPM model."""
+"""构建一维 U-Net、D0-D2 扩散模型或 D3.1 物理引导扩散模型。"""
 
 from __future__ import annotations
 
@@ -9,26 +9,38 @@ from src.one_dimensional_ddpm import (
     Unet1D,
     check_backend_version,
 )
+from src.physics_guided_diffusion import (
+    SersPhysicsGuidedGaussianDiffusion1D,
+)
+from src.sers_physics_constraints import (
+    normalize_physics_configuration,
+)
 
 
 def _get_required_value(
     configuration: dict[str, Any],
     *possible_keys: str,
 ) -> Any:
-    """Read a required value while supporting compatible key names."""
+    """读取必需配置，同时兼容项目历史字段名。"""
 
     for key in possible_keys:
         if key in configuration:
             return configuration[key]
 
-    joined_keys = " 或 ".join(
-        repr(key)
-        for key in possible_keys
-    )
+    joined_keys = " 或 ".join(repr(key) for key in possible_keys)
 
-    raise KeyError(
-        f"模型配置中缺少必要参数：{joined_keys}"
-    )
+    raise KeyError(f"模型配置中缺少必要参数：{joined_keys}")
+
+
+def _validate_positive_integer(value: Any, field_name: str) -> int:
+    """读取大于 0 的整数参数。"""
+
+    parsed = int(value)
+
+    if parsed <= 0:
+        raise ValueError(f"{field_name}必须大于0。")
+
+    return parsed
 
 
 def build_diffusion_model(
@@ -36,58 +48,41 @@ def build_diffusion_model(
     sequence_length: int,
 ) -> tuple[Unet1D, GaussianDiffusion1D]:
     """
-    Build and return the one-dimensional U-Net and diffusion model.
+    构建并返回一维 U-Net 和扩散模型。
 
-    The function accepts the flat model configuration used by the
-    training scripts and tests. It also supports the previous compatible
-    key names such as model_dimension and diffusion_steps.
+    当 ``physics_constraints.enabled=false`` 时，仍构建第三方原始
+    ``GaussianDiffusion1D``，保持 D0-D2.1 行为不变。
 
-    Supported loss-weighting modes:
-
-    - library_default:
-      Keep the loss weighting defined by the installed diffusion library.
-
-    - snr:
-      Explicitly use the library's SNR weighting for pred_x0.
-
-    - uniform:
-      Give every diffusion timestep the same loss weight of 1.0.
+    当 ``physics_constraints.enabled=true`` 时，构建
+    ``SersPhysicsGuidedGaussianDiffusion1D``。该子类只改变训练损失，
+    不改变采样接口和网络参数结构。
     """
 
     check_backend_version()
 
     if not isinstance(model_configuration, dict):
-        raise TypeError(
-            "model_configuration必须是字典。"
-        )
+        raise TypeError("model_configuration必须是字典。")
 
-    sequence_length = int(sequence_length)
+    sequence_length = _validate_positive_integer(
+        sequence_length,
+        "sequence_length",
+    )
 
-    if sequence_length <= 0:
-        raise ValueError(
-            "sequence_length必须大于0。"
-        )
-
-    # 兼容直接传入扁平配置，以及传入完整配置字典两种情况。
+    # 兼容直接传入扁平配置和传入完整 YAML 配置两种情况。
     architecture_configuration = model_configuration.get(
         "model",
         model_configuration,
     )
-
     diffusion_configuration = model_configuration.get(
         "diffusion",
         model_configuration,
     )
 
     if not isinstance(architecture_configuration, dict):
-        raise TypeError(
-            "model配置必须是字典。"
-        )
+        raise TypeError("model配置必须是字典。")
 
     if not isinstance(diffusion_configuration, dict):
-        raise TypeError(
-            "diffusion配置必须是字典。"
-        )
+        raise TypeError("diffusion配置必须是字典。")
 
     dimension_multipliers = tuple(
         int(value)
@@ -98,21 +93,12 @@ def build_diffusion_model(
     )
 
     if not dimension_multipliers:
-        raise ValueError(
-            "dimension_multipliers不能为空。"
-        )
+        raise ValueError("dimension_multipliers不能为空。")
 
-    if any(
-        value <= 0
-        for value in dimension_multipliers
-    ):
-        raise ValueError(
-            "dimension_multipliers中的数值必须大于0。"
-        )
+    if any(value <= 0 for value in dimension_multipliers):
+        raise ValueError("dimension_multipliers中的数值必须大于0。")
 
-    downsample_factor = 2 ** (
-        len(dimension_multipliers) - 1
-    )
+    downsample_factor = 2 ** (len(dimension_multipliers) - 1)
 
     if sequence_length % downsample_factor != 0:
         raise ValueError(
@@ -120,42 +106,28 @@ def build_diffusion_model(
             f"{downsample_factor}整除。"
         )
 
-    base_dimension = int(
+    base_dimension = _validate_positive_integer(
         _get_required_value(
             architecture_configuration,
             "base_dimension",
             "model_dimension",
-        )
+        ),
+        "model.base_dimension",
     )
-
-    if base_dimension <= 0:
-        raise ValueError(
-            "base_dimension必须大于0。"
-        )
-
-    channels = int(
+    channels = _validate_positive_integer(
         _get_required_value(
             architecture_configuration,
             "channels",
-        )
+        ),
+        "model.channels",
     )
-
-    if channels <= 0:
-        raise ValueError(
-            "channels必须大于0。"
-        )
 
     dropout = float(
-        architecture_configuration.get(
-            "dropout",
-            0.0,
-        )
+        architecture_configuration.get("dropout", 0.0)
     )
 
-    if dropout < 0.0 or dropout >= 1.0:
-        raise ValueError(
-            "dropout必须大于等于0且小于1。"
-        )
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError("model.dropout必须在[0,1)范围内。")
 
     unet = Unet1D(
         dim=base_dimension,
@@ -163,43 +135,30 @@ def build_diffusion_model(
         channels=channels,
         dropout=dropout,
         self_condition=bool(
-            architecture_configuration.get(
-                "self_condition",
-                False,
-            )
+            architecture_configuration.get("self_condition", False)
         ),
     )
 
-    diffusion_timesteps = int(
+    diffusion_timesteps = _validate_positive_integer(
         _get_required_value(
             diffusion_configuration,
             "diffusion_timesteps",
             "diffusion_steps",
-        )
+        ),
+        "diffusion.diffusion_steps",
     )
-
-    sampling_timesteps = int(
+    sampling_timesteps = _validate_positive_integer(
         _get_required_value(
             diffusion_configuration,
             "sampling_timesteps",
             "sampling_steps",
-        )
+        ),
+        "diffusion.sampling_steps",
     )
-
-    if diffusion_timesteps <= 0:
-        raise ValueError(
-            "diffusion_timesteps必须大于0。"
-        )
-
-    if sampling_timesteps <= 0:
-        raise ValueError(
-            "sampling_timesteps必须大于0。"
-        )
 
     if sampling_timesteps > diffusion_timesteps:
         raise ValueError(
-            "sampling_timesteps不能大于"
-            "diffusion_timesteps。"
+            "diffusion.sampling_steps不能大于diffusion.diffusion_steps。"
         )
 
     objective = str(
@@ -209,16 +168,9 @@ def build_diffusion_model(
         )
     ).strip().lower()
 
-    supported_objectives = {
-        "pred_noise",
-        "pred_x0",
-        "pred_v",
-    }
-
-    if objective not in supported_objectives:
+    if objective not in {"pred_noise", "pred_x0", "pred_v"}:
         raise ValueError(
-            "diffusion.objective必须为"
-            "pred_noise、pred_x0或pred_v。"
+            "diffusion.objective必须为pred_noise、pred_x0或pred_v。"
         )
 
     loss_weighting = str(
@@ -228,13 +180,7 @@ def build_diffusion_model(
         )
     ).strip().lower()
 
-    supported_loss_weightings = {
-        "library_default",
-        "snr",
-        "uniform",
-    }
-
-    if loss_weighting not in supported_loss_weightings:
+    if loss_weighting not in {"library_default", "snr", "uniform"}:
         raise ValueError(
             "diffusion.loss_weighting必须为"
             "library_default、snr或uniform。"
@@ -246,47 +192,53 @@ def build_diffusion_model(
             "diffusion.objective=pred_x0配合使用。"
         )
 
-    diffusion_model = GaussianDiffusion1D(
-        model=unet,
-        seq_length=sequence_length,
-        timesteps=diffusion_timesteps,
-        sampling_timesteps=sampling_timesteps,
-        objective=objective,
-        beta_schedule=str(
+    common_arguments = {
+        "model": unet,
+        "seq_length": sequence_length,
+        "timesteps": diffusion_timesteps,
+        "sampling_timesteps": sampling_timesteps,
+        "objective": objective,
+        "beta_schedule": str(
             _get_required_value(
                 diffusion_configuration,
                 "beta_schedule",
             )
         ),
-        ddim_sampling_eta=float(
-            diffusion_configuration.get(
-                "ddim_sampling_eta",
-                0.0,
-            )
+        "ddim_sampling_eta": float(
+            diffusion_configuration.get("ddim_sampling_eta", 0.0)
         ),
-        auto_normalize=bool(
-            diffusion_configuration.get(
-                "auto_normalize",
-                True,
-            )
+        "auto_normalize": bool(
+            diffusion_configuration.get("auto_normalize", True)
         ),
+    }
+
+    raw_physics_configuration = model_configuration.get(
+        "physics_constraints",
+        {"enabled": False},
     )
 
-    # denoising-diffusion-pytorch 2.2.6中：
-    #
-    # pred_noise -> 权重为1
-    # pred_x0    -> 权重为SNR
-    # pred_v     -> 权重为SNR / (SNR + 1)
-    #
-    # uniform模式会在模型创建完成后，将所有扩散时间步的
-    # 损失权重覆盖为1，从而避免pred_x0严重忽略高噪声时间步。
+    if raw_physics_configuration is None:
+        raw_physics_configuration = {"enabled": False}
+
+    physics_configuration = normalize_physics_configuration(
+        raw_physics_configuration
+    )
+
+    if bool(physics_configuration.get("enabled", False)):
+        diffusion_model = SersPhysicsGuidedGaussianDiffusion1D(
+            physics_configuration=physics_configuration,
+            **common_arguments,
+        )
+    else:
+        diffusion_model = GaussianDiffusion1D(**common_arguments)
+
+    # denoising-diffusion-pytorch 2.2.6 的默认 pred_x0 权重是 SNR。
+    # D2.1 和 D3.1 的 uniform 模式把所有时间步权重覆盖成 1，
+    # 避免高噪声时间步几乎不参与训练。
     if loss_weighting == "uniform":
         diffusion_model.loss_weight.fill_(1.0)
 
-    # 记录项目配置采用的权重模式。
-    # 该普通属性不会改变第三方库的state_dict结构。
-    diffusion_model.configured_loss_weighting = (
-        loss_weighting
-    )
+    # 普通 Python 属性不会进入 state_dict，仅用于记录实际配置。
+    diffusion_model.configured_loss_weighting = loss_weighting
 
     return unet, diffusion_model
