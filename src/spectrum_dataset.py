@@ -33,6 +33,7 @@ class SpectrumDataset(
         source_files: (
             Sequence[str] | None
         ) = None,
+        constraint_reference_priors: np.ndarray | None = None,
     ) -> None:
         values = np.asarray(
             spectra,
@@ -96,6 +97,23 @@ class SpectrumDataset(
             source_files,
         )
 
+        reference_priors = None
+        if constraint_reference_priors is not None:
+            reference_priors = np.asarray(
+                constraint_reference_priors,
+                dtype=np.float32,
+            )
+            if reference_priors.shape != values.shape:
+                raise ValueError(
+                    "constraint_reference_priors形状必须与spectra一致："
+                    f"先验为{reference_priors.shape}，"
+                    f"光谱为{values.shape}。"
+                )
+            if not np.isfinite(reference_priors).all():
+                raise ValueError(
+                    "constraint_reference_priors中存在NaN或无穷大。"
+                )
+
         # [N,L]转换为DDPM使用的[N,1,L]。
         self.spectra = torch.from_numpy(
             values
@@ -140,6 +158,12 @@ class SpectrumDataset(
             )
         )
 
+        self.constraint_reference_priors = (
+            None
+            if reference_priors is None
+            else torch.from_numpy(reference_priors).unsqueeze(1)
+        )
+
     def __len__(
         self,
     ) -> int:
@@ -150,8 +174,16 @@ class SpectrumDataset(
     def __getitem__(
         self,
         index: int,
-    ) -> torch.Tensor:
-        return self.spectra[index]
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        spectrum = self.spectra[index]
+        if self.constraint_reference_priors is None:
+            return spectrum
+        return {
+            "spectrum": spectrum,
+            "constraint_reference_prior": (
+                self.constraint_reference_priors[index]
+            ),
+        }
 
     def get_original_metadata(
         self,

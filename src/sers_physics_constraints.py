@@ -1329,8 +1329,33 @@ class DifferentiableSersPhysicsLoss(nn.Module):
             self.component_weights.values()
         )
 
-    def inverse_scaled_residual(self, scaled: torch.Tensor) -> torch.Tensor:
-        """按 D2.1 公式可微恢复完整归一化光谱。"""
+    def _resolve_reference_prior(
+        self,
+        scaled: torch.Tensor,
+        reference_prior: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """返回固定D2.1或D2.2逐样本PCA参考先验。"""
+
+        if reference_prior is None:
+            return self.prior
+        if reference_prior.ndim != 3 or reference_prior.shape[1] != 1:
+            raise ValueError("reference_prior必须为[B,1,L]。")
+        if reference_prior.shape[0] != scaled.shape[0]:
+            raise ValueError("reference_prior批量大小与scaled不一致。")
+        if reference_prior.shape[-1] != self.padded_length:
+            raise ValueError("reference_prior长度与padded_length不一致。")
+        return reference_prior[..., : self.original_length].to(
+            device=scaled.device,
+            dtype=scaled.dtype,
+        )
+
+    def inverse_scaled_residual(
+        self,
+        scaled: torch.Tensor,
+        *,
+        reference_prior: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """按 D2.1/D2.2 公式可微恢复完整归一化光谱。"""
 
         if scaled.ndim != 3 or scaled.shape[1] != 1:
             raise ValueError("scaled必须为单通道[B,1,L]。")
@@ -1351,7 +1376,10 @@ class DifferentiableSersPhysicsLoss(nn.Module):
             self.standardized_residual_scale * torch.sinh(argument)
         )
 
-        return self.prior + self.pointwise_scale * standardized
+        return (
+            self._resolve_reference_prior(scaled, reference_prior)
+            + self.pointwise_scale * standardized
+        )
 
     def _smooth(self, values: torch.Tensor) -> torch.Tensor:
         return _smooth_tensor(
@@ -2063,6 +2091,7 @@ class DifferentiableSersPhysicsLoss(nn.Module):
         target_scaled_residual: torch.Tensor,
         timesteps: torch.Tensor,
         alphas_cumprod: torch.Tensor,
+        reference_prior: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if predicted_scaled_residual.shape != target_scaled_residual.shape:
             raise ValueError("预测残差和目标残差形状必须一致。")
@@ -2077,9 +2106,13 @@ class DifferentiableSersPhysicsLoss(nn.Module):
             raise ValueError("timesteps批量大小与残差批量不一致。")
 
         predicted = self.inverse_scaled_residual(
-            predicted_scaled_residual
+            predicted_scaled_residual,
+            reference_prior=reference_prior,
         )
-        target = self.inverse_scaled_residual(target_scaled_residual)
+        target = self.inverse_scaled_residual(
+            target_scaled_residual,
+            reference_prior=reference_prior,
+        )
         peak_components, negative_valley_loss, detected_peaks = (
             self._peak_components(predicted, target)
         )
@@ -2106,18 +2139,25 @@ class DifferentiableSersPhysicsLoss(nn.Module):
         pathology_weighted_sum = torch.zeros_like(roughness_loss)
 
         for name in MORPHOLOGY_COMPONENT_NAMES:
-            morphology_weighted_sum = (
-                morphology_weighted_sum
-                + self.component_weights[name]
-                * components_per_sample[name]
-            )
+            weight = self.component_weights[name]
+
+            # D3.3-A会把逐target形态项显式设为0。跳过乘法可避免
+            # 极端预测下潜在的0 * inf传播成NaN，同时明确这些项不参与
+            # 反向传播。
+            if weight > 0.0:
+                morphology_weighted_sum = (
+                    morphology_weighted_sum
+                    + weight * components_per_sample[name]
+                )
 
         for name in PATHOLOGY_COMPONENT_NAMES:
-            pathology_weighted_sum = (
-                pathology_weighted_sum
-                + self.component_weights[name]
-                * components_per_sample[name]
-            )
+            weight = self.component_weights[name]
+
+            if weight > 0.0:
+                pathology_weighted_sum = (
+                    pathology_weighted_sum
+                    + weight * components_per_sample[name]
+                )
 
         physics_raw_per_sample = (
             morphology_weighted_sum + pathology_weighted_sum

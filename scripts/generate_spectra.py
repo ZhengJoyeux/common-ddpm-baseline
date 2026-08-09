@@ -8,6 +8,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from typing import Any
+
 from src.checkpoint_manager import (
     load_checkpoint_file,
     resolve_label_axis,
@@ -15,6 +17,9 @@ from src.checkpoint_manager import (
 from src.configuration_loader import (
     load_configuration,
     resolve_project_path,
+)
+from src.feature_peak_residual_limiter import (
+    FeaturePeakResidualLimiter,
 )
 from src.intensity_normalizer import (
     GlobalMinMaxNormalizer,
@@ -222,6 +227,129 @@ def build_safe_label_name(
     return safe_name
 
 
+def configure_checkpoint_diversity_constraints(
+    diffusion: torch.nn.Module,
+    checkpoint_configuration: dict[str, Any],
+    metadata: dict[str, Any],
+) -> bool:
+    """按checkpoint状态注册D3.4多样性约束模块。"""
+
+    diversity_configuration = checkpoint_configuration.get(
+        "diversity_constraints",
+        {},
+    )
+
+    diversity_enabled_in_configuration = (
+        isinstance(diversity_configuration, dict)
+        and bool(diversity_configuration.get("enabled", False))
+    )
+
+    diversity_constraint_state = metadata.get(
+        "diversity_constraint_state"
+    )
+
+    # D0–D3.3：既没有配置，也没有保存状态，直接正常跳过。
+    if diversity_constraint_state is None:
+        if diversity_enabled_in_configuration:
+            raise KeyError(
+                "checkpoint配置启用了D3.4多样性约束，"
+                "但metadata中缺少diversity_constraint_state。"
+            )
+
+        return False
+
+    if not isinstance(diversity_constraint_state, dict):
+        raise TypeError(
+            "checkpoint metadata中的diversity_constraint_state"
+            "必须是字典。"
+        )
+
+    diversity_enabled_in_state = bool(
+        diversity_constraint_state.get("enabled", False)
+    )
+
+    if diversity_enabled_in_state != diversity_enabled_in_configuration:
+        raise ValueError(
+            "checkpoint配置与metadata中的D3.4多样性约束启用状态"
+            "不一致，无法安全加载checkpoint。"
+        )
+
+    if not diversity_enabled_in_state:
+        return False
+
+    configure_diversity = getattr(
+        diffusion,
+        "configure_diversity_constraints",
+        None,
+    )
+
+    if not callable(configure_diversity):
+        raise RuntimeError(
+            "当前扩散模型缺少configure_diversity_constraints，"
+            "无法加载D3.4 checkpoint。"
+        )
+
+    configure_diversity(
+        diversity_constraint_state=diversity_constraint_state,
+    )
+
+    return True
+
+
+def load_checkpoint_feature_peak_residual_limiter(
+    *,
+    checkpoint_configuration: dict[str, Any],
+    metadata: dict[str, Any],
+) -> FeaturePeakResidualLimiter | None:
+    """按checkpoint中的D3.5状态恢复生成端峰区残差软上限。"""
+
+    limiter_configuration = checkpoint_configuration.get(
+        "feature_peak_residual_limiter",
+        {"enabled": False},
+    )
+
+    if limiter_configuration is None:
+        limiter_configuration = {"enabled": False}
+
+    if not isinstance(limiter_configuration, dict):
+        raise TypeError(
+            "checkpoint中的feature_peak_residual_limiter必须是字典。"
+        )
+
+    enabled_in_configuration = bool(
+        limiter_configuration.get("enabled", False)
+    )
+    limiter_state = metadata.get(
+        "feature_peak_residual_limiter_state"
+    )
+
+    # D0–D3.4旧检查点既没有该配置也没有该状态，保持可用。
+    if limiter_state is None:
+        if enabled_in_configuration:
+            raise KeyError(
+                "checkpoint配置启用了D3.5特征峰残差软上限，"
+                "但metadata中缺少feature_peak_residual_limiter_state。"
+            )
+        return None
+
+    if not isinstance(limiter_state, dict):
+        raise TypeError(
+            "checkpoint metadata中的feature_peak_residual_limiter_state"
+            "必须是字典。"
+        )
+
+    enabled_in_state = bool(limiter_state.get("enabled", False))
+    if enabled_in_state != enabled_in_configuration:
+        raise ValueError(
+            "checkpoint配置与metadata中的D3.5特征峰残差软上限启用状态"
+            "不一致，无法安全生成。"
+        )
+
+    if not enabled_in_state:
+        return None
+
+    return FeaturePeakResidualLimiter.from_state_dict(limiter_state)
+
 def main() -> None:
     """执行完整的光谱生成和导出流程。"""
 
@@ -410,12 +538,25 @@ def main() -> None:
     # 必须传入检查点中的完整配置，
     # 使model和diffusion两个区段同时生效。
     _, diffusion = build_diffusion_model(
-        model_configuration=(
-            checkpoint_configuration
-        ),
-        sequence_length=(
-            length_adapter.padded_length
-        ),
+    model_configuration=(
+        checkpoint_configuration
+    ),
+    sequence_length=(
+        length_adapter.padded_length
+    ),
+)
+
+    configure_checkpoint_diversity_constraints(
+    diffusion=diffusion,
+    checkpoint_configuration=checkpoint_configuration,
+    metadata=metadata,
+)
+
+    feature_peak_residual_limiter = (
+        load_checkpoint_feature_peak_residual_limiter(
+            checkpoint_configuration=checkpoint_configuration,
+            metadata=metadata,
+        )
     )
 
     requested_model_source = (
@@ -518,6 +659,10 @@ def main() -> None:
         prior_residual_transformer=(
             prior_residual_transformer
         ),
+        feature_peak_residual_limiter=(
+            feature_peak_residual_limiter
+        ),
+        prior_random_seed=random_seed,
     )
 
     inverse_normalizer = None
@@ -676,6 +821,16 @@ def main() -> None:
         f"生成数量："
         f"{spectra.shape[0]}"
     )
+    if feature_peak_residual_limiter is not None:
+        limiter_summary = feature_peak_residual_limiter.summary()
+        print(
+            "D3.5峰区残差软上限：已启用；"
+            f"峰区点数{limiter_summary['feature_peak_point_count']}；"
+            "残差上限倍数"
+            f"{limiter_summary['limit_multiplier']:.3f}"
+        )
+    else:
+        print("D3.5峰区残差软上限：未启用")
     print(
         "生成强度范围："
         f"{float(spectra.min()):.6g}–"

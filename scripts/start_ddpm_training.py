@@ -3,8 +3,6 @@
 
 完整项目测试
 
-set -e
-
 echo "===== 1. Python语法检查 ====="
 python -m compileall -q \
     src \
@@ -60,6 +58,9 @@ from src.configuration_loader import (
 )
 from src.dataset_splitter import split_spectrum_collection
 from src.ddpm_trainer import DdpmTrainer
+from src.feature_peak_residual_limiter import (
+    fit_feature_peak_residual_limiter_state,
+)
 from src.intensity_normalizer import GlobalMinMaxNormalizer
 from src.model_builder import build_diffusion_model
 from src.one_dimensional_ddpm import get_backend_version
@@ -68,6 +69,9 @@ from src.random_seed_manager import (
     create_data_loader_generator,
     seed_data_loader_worker,
     set_random_seed,
+)
+from src.sers_diversity_constraints import (
+    fit_sers_diversity_constraint_state,
 )
 from src.sers_physics_constraints import (
     fit_sers_physics_constraint_state,
@@ -82,8 +86,6 @@ from src.training_logger import TrainingLogger
 
 
 def parse_arguments() -> argparse.Namespace:
-    """读取训练入口命令行参数。"""
-
     parser = argparse.ArgumentParser(
         description="训练一维SERS DDPM。"
     )
@@ -97,13 +99,10 @@ def parse_arguments() -> argparse.Namespace:
         default=None,
         help="可选：从同一模型阶段的checkpoint继续训练。",
     )
-
     return parser.parse_args()
 
 
 def resolve_device(device_text: str) -> torch.device:
-    """解析训练设备并检查 CUDA 是否可用。"""
-
     normalized = str(device_text).strip().lower()
 
     if normalized.startswith("cuda") and not torch.cuda.is_available():
@@ -121,8 +120,6 @@ def validate_split_indices(
     test_indices: np.ndarray,
     number_of_spectra: int,
 ) -> None:
-    """确认三个子集非空、无重复并完整覆盖全部光谱。"""
-
     named_indices = {
         "训练集": training_indices,
         "验证集": validation_indices,
@@ -160,8 +157,6 @@ def validate_split_indices(
 
 
 def resolve_training_log_file(configuration: dict) -> Path:
-    """兼容训练日志的历史路径字段。"""
-
     output = configuration["output"]
 
     if "training_log_file" in output:
@@ -185,12 +180,6 @@ def build_single_spectrum_overfit_collection(
     collection: SpectrumCollection,
     diagnostic_config: dict,
 ) -> tuple[SpectrumCollection, dict[str, object] | None]:
-    """
-    保留项目原有单光谱重复过拟合诊断。
-
-    该模式只验证数据流、模型和采样能否记住一条光谱，不代表泛化性能。
-    """
-
     if not bool(diagnostic_config.get("enabled", False)):
         return collection, None
 
@@ -310,8 +299,6 @@ def resolve_resume_path(
     configuration: dict,
     resume_argument: str,
 ) -> Path:
-    """把 --resume 参数解析为绝对路径。"""
-
     resume_path = Path(resume_argument).expanduser()
 
     if not resume_path.is_absolute():
@@ -333,8 +320,6 @@ def validate_resume_stage(
     checkpoint_path: Path,
     configuration: dict,
 ) -> None:
-    """防止把 D2.1 checkpoint 当作 D3.1 断点直接续训。"""
-
     checkpoint = load_checkpoint_file(
         checkpoint_path,
         map_location="cpu",
@@ -344,41 +329,28 @@ def validate_resume_stage(
     if not isinstance(checkpoint_configuration, dict):
         raise RuntimeError("resume检查点缺少有效configuration。")
 
-    current_physics = configuration.get(
-        "physics_constraints",
-        {},
-    ) or {}
-    checkpoint_physics = checkpoint_configuration.get(
-        "physics_constraints",
-        {},
-    ) or {}
+    for key, description in (
+        ("physics_constraints", "D3物理病态保护"),
+        ("diversity_constraints", "D3.4低噪声多样性约束"),
+        ("feature_peak_residual_limiter", "D3.5特征峰残差软上限"),
+    ):
+        current_value = configuration.get(key, {}) or {}
+        checkpoint_value = checkpoint_configuration.get(key, {}) or {}
 
-    current_enabled = bool(current_physics.get("enabled", False))
-    checkpoint_enabled = bool(
-        checkpoint_physics.get("enabled", False)
-    )
-
-    if current_enabled != checkpoint_enabled:
-        raise ValueError(
-            "当前配置与resume检查点的物理约束阶段不一致。"
-            "D3.1不能从D2.1 checkpoint直接--resume；"
-            "D3.1断点续训必须使用同一D3.1实验的checkpoint。"
-        )
-
-    if current_enabled and current_physics != checkpoint_physics:
-        raise ValueError(
-            "当前D3.1物理约束配置与resume检查点不一致。"
-            "请保持物理损失、阈值和权重完全相同。"
-        )
+        if current_value != checkpoint_value:
+            raise ValueError(
+                f"当前{description}配置与resume检查点不一致。"
+                "D3.4不能从D2.1/D3.2/D3.3 checkpoint直接--resume；"
+                "断点续训只能使用同一D3.4实验的checkpoint。"
+            )
 
 
 def print_prior_residual_summary(
     transformer: PriorResidualTransformer,
     transformed_training_residuals: np.ndarray,
 ) -> None:
-    """打印 D2.1 训练集残差缩放状态。"""
-
-    print("\n===== D2.1先验残差状态 =====")
+    print("\n===== D2先验残差状态 =====")
+    print(f"先验方法：{transformer.prior_method}")
     print(f"残差归一化方法：{transformer.normalization_method}")
 
     statistics = (
@@ -435,6 +407,24 @@ def print_prior_residual_summary(
             f"{transformer.asinh_normalizer:.8g}"
         )
 
+    if transformer.prior_method == "pca_reconstruction":
+        cumulative_ratio = float(
+            np.sum(transformer.pca_explained_variance_ratio_)
+        )
+        print("D2.2 PCA可变先验：已启用")
+        print(
+            "PCA主成分数："
+            f"{transformer.pca_components.shape[0]}"
+        )
+        print(
+            "累计解释方差比例："
+            f"{cumulative_ratio:.6f}"
+        )
+        print(
+            "生成端分数截断范围：训练均值±"
+            f"{transformer.pca_score_clip_standard_deviations:g}×标准差"
+        )
+
     absolute_values = np.abs(transformed_training_residuals)
     percentiles = np.percentile(
         absolute_values,
@@ -454,8 +444,6 @@ def print_prior_residual_summary(
 def print_physics_summary(
     physics_constraint_state: dict[str, object] | None,
 ) -> None:
-    """打印 D3.1 自适应峰检测和异常约束状态。"""
-
     if not physics_constraint_state or not bool(
         physics_constraint_state.get("enabled", False)
     ):
@@ -511,9 +499,117 @@ def print_physics_summary(
     print("========================================\n")
 
 
-def main() -> None:
-    """执行数据读取、划分、D2.1拟合、D3.1拟合和正式训练。"""
+def print_diversity_summary(
+    diversity_constraint_state: dict[str, object] | None,
+) -> None:
+    if not diversity_constraint_state or not bool(
+        diversity_constraint_state.get("enabled", False)
+    ):
+        print("D3.4低噪声残差多样性约束：未启用")
+        return
 
+    diversity = diversity_constraint_state["configuration"]
+    gate = diversity["low_noise_gate"]
+    distance = diversity["pairwise_distance"]
+    correlation = diversity["pairwise_correlation"]
+    variance = diversity["pointwise_variance_floor"]
+
+    print("\n===== D3.4低噪声残差多样性约束 =====")
+    print("人工固定农药峰位：无")
+    number_of_training_spectra = int(
+        diversity_constraint_state.get("number_of_training_spectra", 0)
+    )
+    print(f"训练集拟合残差数量：{number_of_training_spectra}")
+    active_positions = int(
+        np.asarray(diversity_constraint_state["active_mask"]).sum()
+    )
+    print(
+        "有效波数点："
+        f"{active_positions}/"
+        f"{diversity_constraint_state['original_length']}"
+    )
+    print(
+        "低噪声门控：alpha_bar >= "
+        f"{float(gate['minimum_alpha_cumprod']):.3f}，"
+        "有效样本数 >= "
+        f"{int(gate['minimum_samples'])}"
+    )
+    print(
+        "成对距离范围：目标距离的 "
+        f"{float(distance['minimum_distance_ratio']):.2f}–"
+        f"{float(distance['maximum_distance_ratio']):.2f} 倍"
+    )
+    print(
+        "相关性最大额外容许值："
+        f"{float(correlation['maximum_excess_correlation']):.4f}"
+    )
+    print(
+        "逐点标准差下限：训练集标准差的 "
+        f"{float(variance['minimum_std_ratio']):.2f} 倍"
+    )
+    print(f"多样性总权重：{float(diversity['total_weight']):g}")
+    print("固定中位数prior：本阶段保持不变，用于单变量消融")
+    print("====================================\n")
+
+
+def print_feature_peak_residual_limiter_summary(
+    limiter_state: dict[str, object] | None,
+) -> None:
+    """打印仅由训练集拟合的 D3.5 采样端残差上限。"""
+
+    if not limiter_state or not bool(limiter_state.get("enabled", False)):
+        print("D3.5特征峰残差软上限：未启用")
+        return
+
+    limiter = limiter_state["configuration"]
+    selected_shifts = np.asarray(
+        limiter_state["selected_peak_raman_shifts"],
+        dtype=np.float64,
+    )
+    limits = np.asarray(
+        limiter_state["pointwise_soft_limit"],
+        dtype=np.float64,
+    )
+    active_mask = np.asarray(
+        limiter_state["feature_peak_mask"],
+        dtype=np.uint8,
+    ).astype(bool)
+    active_limits = limits[active_mask]
+
+    print("\n===== D3.5特征峰残差软上限 =====")
+    print("作用位置：采样结束、加回先验后、轴插值和反归一化前")
+    print(
+        "训练集拟合光谱数："
+        f"{int(limiter_state['number_of_training_spectra'])}"
+    )
+    print(f"自动识别先验特征峰数：{selected_shifts.size}")
+    print(
+        "先验特征峰位移："
+        + "、".join(f"{value:.2f}" for value in selected_shifts)
+        + " cm^-1"
+    )
+    print(
+        "峰区残差参考分位数："
+        f"{float(limiter_state['absolute_residual_quantile']):.2f}%"
+    )
+    print(
+        "残差上限倍数："
+        f"{float(limiter['limit_multiplier']):.3f}"
+    )
+    print(
+        "峰区软上限范围（归一化强度域）："
+        f"{float(active_limits.min()):.8g}–"
+        f"{float(active_limits.max()):.8g}"
+    )
+    print(
+        "峰区软过渡比例："
+        f"{float(limiter['soft_transition_fraction']):.3f}"
+    )
+    print("非特征峰区域：不修改")
+    print("================================\n")
+
+
+def main() -> None:
     arguments = parse_arguments()
     configuration = load_configuration(arguments.config)
 
@@ -571,7 +667,6 @@ def main() -> None:
                 "单光谱过拟合诊断必须从头训练，不能使用--resume。"
             )
 
-        # 只修改内存中的配置，不改写 YAML 文件。
         data_config = dict(data_config)
         data_config["split_unit"] = "spectrum"
         data_config["shuffle"] = False
@@ -607,7 +702,6 @@ def main() -> None:
         number_of_spectra=number_of_spectra,
     )
 
-    # 建立统一拉曼训练轴，并把网络长度补齐到 U-Net 下采样倍数。
     length_adapter = SpectrumLengthAdapter.create(
         raman_shifts=collection.raman_shifts,
         dimension_multipliers=model_config[
@@ -657,10 +751,6 @@ def main() -> None:
     if not np.isfinite(spectra_on_model_axis).all():
         raise RuntimeError("插值后的光谱包含NaN或无穷值。")
 
-    # ------------------------------------------------------------------
-    # 训练集 global_minmax 归一化
-    # ------------------------------------------------------------------
-
     normalizer: GlobalMinMaxNormalizer | None = None
     normalization_state = None
 
@@ -680,7 +770,6 @@ def main() -> None:
             ),
         )
 
-        # 归一化参数只在训练集拟合。
         normalizer.fit(
             spectra_on_model_axis[training_indices]
         )
@@ -698,10 +787,6 @@ def main() -> None:
     else:
         normalized_full_spectra = spectra_on_model_axis.copy()
 
-    # ------------------------------------------------------------------
-    # D2.1 pointwise MAD-asinh 先验残差变换
-    # ------------------------------------------------------------------
-
     prior_config = configuration.get("prior_residual", {}) or {}
     prior_residual_transformer: PriorResidualTransformer | None = None
     prior_residual_state = None
@@ -715,6 +800,12 @@ def main() -> None:
             )
 
         prior_residual_transformer = PriorResidualTransformer(
+            prior_method=str(
+                prior_config.get(
+                    "prior_method",
+                    "training_pointwise_median",
+                )
+            ),
             normalization_method=str(
                 prior_config.get(
                     "residual_normalization",
@@ -739,6 +830,22 @@ def main() -> None:
             epsilon=float(
                 prior_config.get("epsilon", 1.0e-8)
             ),
+            pca_explained_variance_ratio=float(
+                prior_config.get("pca_explained_variance_ratio", 0.95)
+            ),
+            pca_max_components=prior_config.get("pca_max_components"),
+            pca_sampling_strategy=str(
+                prior_config.get(
+                    "pca_sampling_strategy",
+                    "truncated_gaussian_scores",
+                )
+            ),
+            pca_score_clip_standard_deviations=float(
+                prior_config.get(
+                    "pca_score_clip_standard_deviations",
+                    2.5,
+                )
+            ),
         )
 
         prior_residual_transformer.fit(
@@ -761,10 +868,6 @@ def main() -> None:
             training_scaled_residuals,
         )
 
-    # ------------------------------------------------------------------
-    # D3.1：只用训练集拟合自适应峰检测阈值和异常范围
-    # ------------------------------------------------------------------
-
     physics_constraint_state = None
 
     if bool(physics_config.get("enabled", False)):
@@ -786,13 +889,75 @@ def main() -> None:
         )
         print_physics_summary(physics_constraint_state)
 
-    # 完成 D2/D3 状态拟合后再补齐网络输入长度。
+    diversity_constraint_state = None
+    diversity_config = configuration.get(
+        "diversity_constraints",
+        {"enabled": False},
+    )
+
+    if bool(diversity_config.get("enabled", False)):
+        diversity_constraint_state = (
+            fit_sers_diversity_constraint_state(
+                training_scaled_residuals=training_scaled_residuals,
+                configuration=diversity_config,
+            )
+        )
+        print_diversity_summary(diversity_constraint_state)
+
+    feature_peak_residual_limiter_state = None
+    limiter_config = configuration.get(
+        "feature_peak_residual_limiter",
+        {"enabled": False},
+    )
+
+    if bool(limiter_config.get("enabled", False)):
+        if prior_residual_transformer is None:
+            raise ValueError(
+                "D3.5特征峰残差软上限要求先完成D2.1先验残差拟合。"
+            )
+
+        feature_peak_residual_limiter_state = (
+            fit_feature_peak_residual_limiter_state(
+                training_normalized_spectra=(
+                    normalized_full_spectra[training_indices]
+                ),
+                prior_normalized_intensity=(
+                    prior_residual_transformer.prior
+                ),
+                raman_shift=np.asarray(
+                    length_adapter.model_raman_shift,
+                    dtype=np.float64,
+                ),
+                configuration=limiter_config,
+            )
+        )
+        print_feature_peak_residual_limiter_summary(
+            feature_peak_residual_limiter_state
+        )
+
     padded_spectra = length_adapter.adapt(spectra_for_model)
+
+    padded_constraint_reference_priors = None
+    if (
+        prior_residual_transformer is not None
+        and prior_residual_transformer.prior_method == "pca_reconstruction"
+    ):
+        constraint_reference_priors = (
+            prior_residual_transformer.reference_priors_for_spectra(
+                normalized_full_spectra
+            )
+        )
+        padded_constraint_reference_priors = length_adapter.adapt(
+            constraint_reference_priors
+        )
 
     if not np.isfinite(padded_spectra).all():
         raise RuntimeError("模型输入包含NaN或无穷值。")
 
-    spectrum_dataset = SpectrumDataset(padded_spectra)
+    spectrum_dataset = SpectrumDataset(
+        padded_spectra,
+        constraint_reference_priors=padded_constraint_reference_priors,
+    )
     training_dataset = Subset(
         spectrum_dataset,
         training_indices.tolist(),
@@ -805,10 +970,6 @@ def main() -> None:
         spectrum_dataset,
         test_indices.tolist(),
     )
-
-    # ------------------------------------------------------------------
-    # DataLoader 和 step 频率换算
-    # ------------------------------------------------------------------
 
     device = resolve_device(str(training_config["device"]))
     number_of_workers = int(
@@ -891,10 +1052,6 @@ def main() -> None:
     )
     training_config["log_every_steps"] = log_every_batches
 
-    # ------------------------------------------------------------------
-    # 模型构建和 D3.1 状态注入
-    # ------------------------------------------------------------------
-
     _, diffusion = build_diffusion_model(
         model_configuration=configuration,
         sequence_length=length_adapter.padded_length,
@@ -915,6 +1072,22 @@ def main() -> None:
         configure_physics(
             physics_constraint_state=physics_constraint_state,
             prior_residual_state=prior_residual_state,
+        )
+
+    if diversity_constraint_state is not None:
+        configure_diversity = getattr(
+            diffusion,
+            "configure_diversity_constraints",
+            None,
+        )
+
+        if not callable(configure_diversity):
+            raise RuntimeError(
+                "D3.4扩散模型缺少configure_diversity_constraints。"
+            )
+
+        configure_diversity(
+            diversity_constraint_state=diversity_constraint_state,
         )
 
     checkpoint_manager = CheckpointManager(
@@ -956,6 +1129,10 @@ def main() -> None:
         "normalization_state": normalization_state,
         "prior_residual_state": prior_residual_state,
         "physics_constraint_state": physics_constraint_state,
+        "diversity_constraint_state": diversity_constraint_state,
+        "feature_peak_residual_limiter_state": (
+            feature_peak_residual_limiter_state
+        ),
         "axis_metadata": axis_metadata,
         **length_adapter.to_metadata(),
     }
@@ -981,10 +1158,6 @@ def main() -> None:
             configuration=configuration,
         )
         trainer.resume(resume_path)
-
-    # ------------------------------------------------------------------
-    # 训练前终端摘要
-    # ------------------------------------------------------------------
 
     labels = sorted({str(value) for value in collection.labels})
     original_lengths = sorted(

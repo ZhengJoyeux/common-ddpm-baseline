@@ -1,8 +1,10 @@
-"""构建一维 U-Net、D0-D2 扩散模型或 D3.1 物理引导扩散模型。"""
+"""构建一维 U-Net、D0-D2 扩散模型或 D3 物理/多样性扩散模型。"""
 
 from __future__ import annotations
 
 from typing import Any
+
+import torch
 
 from src.one_dimensional_ddpm import (
     GaussianDiffusion1D,
@@ -11,6 +13,9 @@ from src.one_dimensional_ddpm import (
 )
 from src.physics_guided_diffusion import (
     SersPhysicsGuidedGaussianDiffusion1D,
+)
+from src.sers_diversity_constraints import (
+    normalize_diversity_configuration,
 )
 from src.sers_physics_constraints import (
     normalize_physics_configuration,
@@ -43,6 +48,79 @@ def _validate_positive_integer(value: Any, field_name: str) -> int:
     return parsed
 
 
+def _configure_high_noise_loss_weight(
+    diffusion_model: GaussianDiffusion1D,
+    diffusion_configuration: dict[str, Any],
+    diffusion_timesteps: int,
+) -> None:
+    """为高噪声时间步建立递增的DDPM主损失权重。
+
+    权重按训练时间步从低噪声到高噪声递增，并在最后按平均值归一化，
+    这样可以提高中高噪声时间步的重要性，同时避免整体损失尺度发生
+    不必要的大幅改变。
+    """
+
+    high_noise = diffusion_configuration.get("high_noise", {})
+
+    if high_noise is None:
+        high_noise = {}
+
+    if not isinstance(high_noise, dict):
+        raise TypeError("diffusion.high_noise必须是字典。")
+
+    minimum_weight = float(
+        high_noise.get("minimum_weight", 0.50)
+    )
+    maximum_weight = float(
+        high_noise.get("maximum_weight", 2.00)
+    )
+    ramp_power = float(
+        high_noise.get("ramp_power", 1.0)
+    )
+
+    if minimum_weight <= 0.0:
+        raise ValueError(
+            "diffusion.high_noise.minimum_weight必须大于0。"
+        )
+
+    if maximum_weight <= minimum_weight:
+        raise ValueError(
+            "diffusion.high_noise.maximum_weight必须大于"
+            "minimum_weight。"
+        )
+
+    if ramp_power <= 0.0:
+        raise ValueError(
+            "diffusion.high_noise.ramp_power必须大于0。"
+        )
+
+    progress = torch.linspace(
+        0.0,
+        1.0,
+        steps=diffusion_timesteps,
+        dtype=diffusion_model.loss_weight.dtype,
+        device=diffusion_model.loss_weight.device,
+    )
+    weights = minimum_weight + (
+        maximum_weight - minimum_weight
+    ) * progress.pow(ramp_power)
+    weights = weights / weights.mean().clamp_min(
+        torch.finfo(weights.dtype).eps
+    )
+
+    if tuple(weights.shape) != tuple(
+        diffusion_model.loss_weight.shape
+    ):
+        raise RuntimeError(
+            "高噪声损失权重的长度与扩散时间步数量不一致："
+            f"weights={tuple(weights.shape)}，"
+            f"loss_weight={tuple(diffusion_model.loss_weight.shape)}。"
+        )
+
+    with torch.no_grad():
+        diffusion_model.loss_weight.copy_(weights)
+
+
 def build_diffusion_model(
     model_configuration: dict[str, Any],
     sequence_length: int,
@@ -50,11 +128,12 @@ def build_diffusion_model(
     """
     构建并返回一维 U-Net 和扩散模型。
 
-    当 ``physics_constraints.enabled=false`` 时，仍构建第三方原始
-    ``GaussianDiffusion1D``，保持 D0-D2.1 行为不变。
+    当 physics_constraints.enabled=false 且
+    diversity_constraints.enabled=false 时，仍构建第三方原始
+    GaussianDiffusion1D，保持 D0-D2.1 行为不变。
 
-    当 ``physics_constraints.enabled=true`` 时，构建
-    ``SersPhysicsGuidedGaussianDiffusion1D``。该子类只改变训练损失，
+    当 physics_constraints 或 diversity_constraints 任意一个启用时，
+    构建 SersPhysicsGuidedGaussianDiffusion1D。该子类只改变训练损失，
     不改变采样接口和网络参数结构。
     """
 
@@ -68,7 +147,6 @@ def build_diffusion_model(
         "sequence_length",
     )
 
-    # 兼容直接传入扁平配置和传入完整 YAML 配置两种情况。
     architecture_configuration = model_configuration.get(
         "model",
         model_configuration,
@@ -180,10 +258,15 @@ def build_diffusion_model(
         )
     ).strip().lower()
 
-    if loss_weighting not in {"library_default", "snr", "uniform"}:
+    if loss_weighting not in {
+        "library_default",
+        "snr",
+        "uniform",
+        "high_noise",
+    }:
         raise ValueError(
             "diffusion.loss_weighting必须为"
-            "library_default、snr或uniform。"
+            "library_default、snr、uniform或high_noise。"
         )
 
     if loss_weighting == "snr" and objective != "pred_x0":
@@ -224,21 +307,39 @@ def build_diffusion_model(
         raw_physics_configuration
     )
 
-    if bool(physics_configuration.get("enabled", False)):
+    raw_diversity_configuration = model_configuration.get(
+        "diversity_constraints",
+        {"enabled": False},
+    )
+
+    if raw_diversity_configuration is None:
+        raw_diversity_configuration = {"enabled": False}
+
+    diversity_configuration = normalize_diversity_configuration(
+        raw_diversity_configuration
+    )
+
+    if (
+        bool(physics_configuration.get("enabled", False))
+        or bool(diversity_configuration.get("enabled", False))
+    ):
         diffusion_model = SersPhysicsGuidedGaussianDiffusion1D(
             physics_configuration=physics_configuration,
+            diversity_configuration=diversity_configuration,
             **common_arguments,
         )
     else:
         diffusion_model = GaussianDiffusion1D(**common_arguments)
 
-    # denoising-diffusion-pytorch 2.2.6 的默认 pred_x0 权重是 SNR。
-    # D2.1 和 D3.1 的 uniform 模式把所有时间步权重覆盖成 1，
-    # 避免高噪声时间步几乎不参与训练。
     if loss_weighting == "uniform":
         diffusion_model.loss_weight.fill_(1.0)
+    elif loss_weighting == "high_noise":
+        _configure_high_noise_loss_weight(
+            diffusion_model,
+            diffusion_configuration,
+            diffusion_timesteps,
+        )
 
-    # 普通 Python 属性不会进入 state_dict，仅用于记录实际配置。
     diffusion_model.configured_loss_weighting = loss_weighting
 
     return unet, diffusion_model

@@ -2,10 +2,13 @@
 
 该脚本同时支持：
 1. D0/D1：模型直接学习完整的全局归一化光谱；
-2. D2：模型学习“完整归一化光谱-训练集中位数先验”的缩放残差。
+2. D2：模型学习“完整归一化光谱-参考先验”的缩放残差。
 
 D2诊断必须在缩放残差域中执行前向加噪和模型恢复，然后依次：
-缩放残差 -> 加回中位数先验 -> 完整归一化光谱 -> 原始强度光谱。
+缩放残差 -> 加回对应参考先验 -> 完整归一化光谱 -> 原始强度光谱。
+
+对于D2.2 PCA可变先验，诊断使用当前真实光谱对应的
+``reference_priors``，不使用随机采样先验，也不退回固定中位数先验。
 """
 
 from __future__ import annotations
@@ -196,6 +199,7 @@ def load_prior_residual_transformer(
 def restore_full_normalized_spectra(
     model_domain_spectra: np.ndarray,
     prior_transformer: PriorResidualTransformer | None,
+    reference_priors: np.ndarray | None = None,
 ) -> np.ndarray:
     """把模型数据域输出恢复为完整的全局归一化光谱。"""
 
@@ -204,7 +208,86 @@ def restore_full_normalized_spectra(
     if prior_transformer is None:
         return values
 
-    return prior_transformer.inverse_transform(values)
+    return prior_transformer.inverse_transform(
+        values,
+        reference_priors=reference_priors,
+    )
+
+
+def configure_checkpoint_diversity_constraints(
+    diffusion: torch.nn.Module,
+    checkpoint_configuration: dict[str, Any],
+    metadata: dict[str, Any],
+) -> bool:
+    """按checkpoint状态注册D3.4多样性约束模块。
+
+    D3.4的多样性约束模块含有缓冲区，例如逐波数标准差和白化
+    标准差。这些缓冲区会被保存进state_dict。因此，必须在
+    ``load_state_dict(strict=True)``之前重建并注册该模块；否则D3.4
+    checkpoint会被误判为包含“Unexpected key(s)”。
+
+    对D0–D3.3 checkpoint，本函数不注册任何模块并返回False。
+    """
+
+    diversity_configuration = checkpoint_configuration.get(
+        "diversity_constraints",
+        {},
+    )
+
+    diversity_enabled_in_configuration = (
+        isinstance(diversity_configuration, dict)
+        and bool(diversity_configuration.get("enabled", False))
+    )
+
+    diversity_constraint_state = metadata.get(
+        "diversity_constraint_state"
+    )
+
+    if diversity_constraint_state is None:
+        if diversity_enabled_in_configuration:
+            raise KeyError(
+                "checkpoint配置启用了D3.4多样性约束，"
+                "但metadata中缺少diversity_constraint_state。"
+            )
+
+        return False
+
+    if not isinstance(diversity_constraint_state, dict):
+        raise TypeError(
+            "checkpoint metadata中的diversity_constraint_state"
+            "必须是字典。"
+        )
+
+    diversity_enabled_in_state = bool(
+        diversity_constraint_state.get("enabled", False)
+    )
+
+    if diversity_enabled_in_state != diversity_enabled_in_configuration:
+        raise ValueError(
+            "checkpoint配置与metadata中的D3.4多样性约束启用状态"
+            "不一致，无法安全加载checkpoint。"
+        )
+
+    if not diversity_enabled_in_state:
+        return False
+
+    configure_diversity = getattr(
+        diffusion,
+        "configure_diversity_constraints",
+        None,
+    )
+
+    if not callable(configure_diversity):
+        raise RuntimeError(
+            "当前扩散模型缺少configure_diversity_constraints，"
+            "无法加载D3.4 checkpoint。"
+        )
+
+    configure_diversity(
+        diversity_constraint_state=diversity_constraint_state,
+    )
+
+    return True
 
 
 def main() -> None:
@@ -305,6 +388,14 @@ def main() -> None:
         sequence_length=length_adapter.padded_length,
     )
 
+    diversity_constraints_enabled = (
+        configure_checkpoint_diversity_constraints(
+            diffusion=diffusion,
+            checkpoint_configuration=checkpoint_configuration,
+            metadata=metadata,
+        )
+    )
+
     if arguments.model_source == "raw":
         if "diffusion_state" not in checkpoint:
             raise KeyError("checkpoint中缺少diffusion_state。")
@@ -391,8 +482,13 @@ def main() -> None:
         metadata,
     )
 
+    # D2.2 PCA可变先验：为当前诊断光谱解析其对应参考先验。
+    # 后续transform、prior-only恢复和预测恢复必须使用同一个先验。
+    true_reference_priors: np.ndarray | None
+
     if prior_transformer is None:
         diagnostic_mode = "full_normalized_spectrum"
+        true_reference_priors = None
         true_model_domain_2d = np.asarray(
             true_normalized_2d,
             dtype=np.float32,
@@ -402,12 +498,24 @@ def main() -> None:
     else:
         diagnostic_mode = "prior_residual_scaled"
 
-        # D2的模型输入必须是缩放残差，不能把完整光谱直接送入模型。
-        true_model_domain_2d = prior_transformer.transform(
-            true_normalized_2d
+        true_reference_priors = (
+            prior_transformer.reference_priors_for_spectra(
+                true_normalized_2d
+            )
         )
 
-        prior_normalized_2d = prior_transformer.prior_batch(1)
+        # D2的模型输入必须是缩放残差，不能把完整光谱直接送入模型。
+        true_model_domain_2d = prior_transformer.transform(
+            true_normalized_2d,
+            reference_priors=true_reference_priors,
+        )
+
+        # 先验基线必须是当前真实光谱对应的先验。
+        # 对D2.2而言不能使用prior_batch(1)替代reference_priors。
+        prior_normalized_2d = np.asarray(
+            true_reference_priors,
+            dtype=np.float32,
+        )
         prior_original_2d = normalizer.inverse_transform(
             prior_normalized_2d
         )
@@ -578,11 +686,13 @@ def main() -> None:
                 dtype=np.float64,
             )
 
-            # D2必须先加回中位数先验，再进行全局反归一化。
+            # D2必须先加回当前真实光谱对应的参考先验，
+            # 再进行全局反归一化。
             predicted_normalized_unclipped_2d = (
                 restore_full_normalized_spectra(
                     predicted_model_unclipped_2d,
                     prior_transformer,
+                    reference_priors=true_reference_priors,
                 )
             )
 
@@ -590,6 +700,7 @@ def main() -> None:
                 restore_full_normalized_spectra(
                     predicted_model_clipped_2d,
                     prior_transformer,
+                    reference_priors=true_reference_priors,
                 )
             )
 
@@ -628,7 +739,7 @@ def main() -> None:
 
             # 简单基线假定模型数据域中的x0=0：
             # D0/D1中表示零归一化信号；
-            # D2中表示零缩放残差，即“只使用中位数先验”。
+            # D2中表示零缩放残差，即“只使用对应参考先验”。
             if noise_coefficient > 1.0e-12:
                 baseline_noise_tensor = (
                     noisy_spectrum / noise_coefficient
@@ -886,6 +997,7 @@ def main() -> None:
                 "model_source",
                 "objective",
                 "diagnostic_mode",
+                "d3_4_diversity_constraints",
                 "total_timesteps",
                 "diagnostic_timesteps",
                 "seed",
@@ -898,6 +1010,9 @@ def main() -> None:
                 arguments.model_source,
                 str(diffusion.objective),
                 diagnostic_mode,
+                "enabled"
+                if diversity_constraints_enabled
+                else "not_enabled",
                 total_timesteps,
                 ",".join(str(value) for value in timesteps),
                 arguments.seed,
@@ -1085,6 +1200,12 @@ def main() -> None:
     print(f"诊断时间步：{timesteps}")
     print(f"模型来源：{arguments.model_source}")
     print(f"诊断数据域：{diagnostic_mode}")
+    print(
+        "D3.4多样性约束："
+        "已按checkpoint状态注册"
+        if diversity_constraints_enabled
+        else "未启用"
+    )
     print(f"诊断随机种子：{arguments.seed}")
     print(f"原始光谱索引：{spectrum_index}")
     print(
@@ -1183,7 +1304,7 @@ def main() -> None:
     if prior_transformer is not None:
         print(
             "4. D2中的零模型信号表示零缩放残差，"
-            "对应完整光谱域中的仅中位数先验。"
+            "对应完整光谱域中的仅参考先验。"
         )
         print(
             "5. unclipped_model_to_prior_original_rmse_ratio < 1，"

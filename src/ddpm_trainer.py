@@ -1,9 +1,10 @@
-"""D0-D3.2 一维 SERS DDPM 的训练、验证、EMA 和 checkpoint 管理。"""
+"""D0-D3.3 一维 SERS DDPM 的训练、验证、EMA 和 checkpoint 管理。"""
 
 from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import random
 from typing import Iterable
 
 import torch
@@ -141,6 +142,12 @@ class DdpmTrainer:
         self.maximum_validation_batches = int(
             training.get("maximum_validation_batches", 0)
         )
+        self.validation_random_seed = int(
+            training.get(
+                "validation_random_seed",
+                configuration.get("project", {}).get("random_seed", 2026),
+            )
+        )
 
         self.optimizer = AdamW(
             self.diffusion.parameters(),
@@ -203,7 +210,67 @@ class DdpmTrainer:
             f"历史最佳验证损失={self.best_validation_loss:.6f}"
         )
 
-    def _next_training_batch(self) -> torch.Tensor:
+    def _move_batch_to_device(
+        self,
+        batch,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """兼容历史张量batch和D2.2带逐样本PCA先验的字典batch。"""
+
+        reference_prior = None
+        if isinstance(batch, dict):
+            if "spectrum" not in batch:
+                raise KeyError("数据集字典batch缺少spectrum。")
+            spectrum = batch["spectrum"]
+            reference_prior = batch.get("constraint_reference_prior")
+        elif isinstance(batch, (tuple, list)):
+            spectrum = batch[0]
+            if len(batch) > 1:
+                reference_prior = batch[1]
+        else:
+            spectrum = batch
+
+        if not torch.is_tensor(spectrum):
+            raise TypeError("训练batch中的spectrum必须是torch.Tensor。")
+        spectrum = spectrum.to(self.device, non_blocking=True)
+
+        if reference_prior is None:
+            return spectrum, None
+        if not torch.is_tensor(reference_prior):
+            raise TypeError(
+                "constraint_reference_prior必须是torch.Tensor。"
+            )
+        reference_prior = reference_prior.to(self.device, non_blocking=True)
+        if reference_prior.shape != spectrum.shape:
+            raise ValueError(
+                "constraint_reference_prior形状必须与spectrum一致。"
+            )
+        return spectrum, reference_prior
+
+    def _calculate_loss(
+        self,
+        spectrum: torch.Tensor,
+        constraint_reference_prior: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if constraint_reference_prior is None:
+            return self.diffusion(spectrum)
+        if not bool(
+            getattr(
+                self.diffusion,
+                "supports_constraint_reference_prior",
+                False,
+            )
+        ):
+            raise RuntimeError(
+                "当前扩散模型不支持D2.2逐样本PCA先验。"
+                "请同时启用D3 physics_constraints或"
+                "diversity_constraints，并使用D2.2完整代码。"
+            )
+        return self.diffusion(
+            spectrum,
+            constraint_reference_prior=constraint_reference_prior,
+        )
+
+    def _next_training_batch(self) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self._training_iterator is None:
             self._training_iterator = iter(self.training_loader)
 
@@ -213,13 +280,7 @@ class DdpmTrainer:
             self._training_iterator = iter(self.training_loader)
             batch = next(self._training_iterator)
 
-        if isinstance(batch, (tuple, list)):
-            batch = batch[0]
-
-        return batch.to(
-            self.device,
-            non_blocking=True,
-        )
+        return self._move_batch_to_device(batch)
 
     def _read_loss_components(
         self,
@@ -301,46 +362,74 @@ class DdpmTrainer:
 
     @torch.no_grad()
     def validate(self) -> float:
+        """在固定随机时间步和噪声下计算可比较的验证损失。
+
+        DDPM 的 ``forward`` 会随机抽取时间步和高斯噪声。若每次验证
+        使用不同随机输入，best.pt 可能只是一次随机噪声较容易的结果。
+        此处暂存并恢复训练 RNG 状态，因此固定验证不会改变后续训练的
+        随机序列或 DataLoader shuffle 行为。
+        """
+
         self.diffusion.eval()
         accumulated_loss: torch.Tensor | None = None
         accumulated_components: dict[str, torch.Tensor] = {}
         number_of_batches = 0
 
-        for batch_index, batch in enumerate(self.validation_loader):
-            if (
-                self.maximum_validation_batches > 0
-                and batch_index >= self.maximum_validation_batches
+        python_random_state = random.getstate()
+        cuda_devices = []
+
+        if self.device.type == "cuda":
+            cuda_devices = [
+                torch.cuda.current_device()
+                if self.device.index is None
+                else self.device.index
+            ]
+
+        try:
+            with torch.random.fork_rng(
+                devices=cuda_devices,
+                enabled=True,
             ):
-                break
+                random.seed(self.validation_random_seed)
+                torch.manual_seed(self.validation_random_seed)
 
-            if isinstance(batch, (tuple, list)):
-                batch = batch[0]
+                for batch_index, batch in enumerate(
+                    self.validation_loader
+                ):
+                    if (
+                        self.maximum_validation_batches > 0
+                        and batch_index >= self.maximum_validation_batches
+                    ):
+                        break
 
-            batch = batch.to(
-                self.device,
-                non_blocking=True,
-            )
+                    spectrum, constraint_reference_prior = (
+                        self._move_batch_to_device(batch)
+                    )
 
-            with torch.autocast(
-                device_type=self.device.type,
-                dtype=torch.float16,
-                enabled=self.use_mixed_precision,
-            ):
-                loss = self.diffusion(batch)
+                    with torch.autocast(
+                        device_type=self.device.type,
+                        dtype=torch.float16,
+                        enabled=self.use_mixed_precision,
+                    ):
+                        loss = self._calculate_loss(
+                            spectrum,
+                            constraint_reference_prior,
+                        )
 
-            detached_loss = loss.detach()
-            accumulated_loss = (
-                detached_loss.clone()
-                if accumulated_loss is None
-                else accumulated_loss + detached_loss
-            )
-            self._accumulate_components(
-                accumulated_components,
-                self._read_loss_components(loss),
-            )
-            number_of_batches += 1
-
-        self.diffusion.train()
+                    detached_loss = loss.detach()
+                    accumulated_loss = (
+                        detached_loss.clone()
+                        if accumulated_loss is None
+                        else accumulated_loss + detached_loss
+                    )
+                    self._accumulate_components(
+                        accumulated_components,
+                        self._read_loss_components(loss),
+                    )
+                    number_of_batches += 1
+        finally:
+            random.setstate(python_random_state)
+            self.diffusion.train()
 
         if number_of_batches == 0 or accumulated_loss is None:
             raise RuntimeError("验证集没有产生任何批次。")
@@ -389,8 +478,6 @@ class DdpmTrainer:
         accumulated_log_loss: torch.Tensor | None = None
         accumulated_log_components: dict[str, torch.Tensor] = {}
         number_of_logged_steps = 0
-        latest_validation_loss: float | None = None
-
         for step in range(
             self.starting_step + 1,
             self.total_training_steps + 1,
@@ -400,14 +487,19 @@ class DdpmTrainer:
             step_components: dict[str, torch.Tensor] = {}
 
             for _ in range(self.gradient_accumulation_steps):
-                batch = self._next_training_batch()
+                spectrum, constraint_reference_prior = (
+                    self._next_training_batch()
+                )
 
                 with torch.autocast(
                     device_type=self.device.type,
                     dtype=torch.float16,
                     enabled=self.use_mixed_precision,
                 ):
-                    loss = self.diffusion(batch)
+                    loss = self._calculate_loss(
+                        spectrum,
+                        constraint_reference_prior,
+                    )
                     backward_loss = (
                         loss / self.gradient_accumulation_steps
                     )
@@ -456,12 +548,20 @@ class DdpmTrainer:
                 step % self.validate_every_steps == 0
                 or step == self.total_training_steps
             )
+            validation_loss_for_log: float | None = None
+            validation_components_for_log: dict[str, float] | None = None
 
             if should_validate:
-                latest_validation_loss = self.validate()
+                validation_loss_for_log = self.validate()
+                validation_components_for_log = (
+                    self.latest_validation_components
+                )
 
-                if latest_validation_loss < self.best_validation_loss:
-                    self.best_validation_loss = latest_validation_loss
+                if (
+                    validation_loss_for_log
+                    < self.best_validation_loss
+                ):
+                    self.best_validation_loss = validation_loss_for_log
                     self._save_checkpoint(
                         step=step,
                         file_name="best.pt",
@@ -496,12 +596,10 @@ class DdpmTrainer:
                 self.logger.record(
                     step=step,
                     training_loss=average_training_loss,
-                    validation_loss=latest_validation_loss,
+                    validation_loss=validation_loss_for_log,
                     learning_rate=learning_rate,
                     training_components=average_training_components,
-                    validation_components=(
-                        self.latest_validation_components
-                    ),
+                    validation_components=validation_components_for_log,
                 )
 
                 accumulated_log_loss = None

@@ -12,6 +12,14 @@ GLOBAL_MAXABS = "global_maxabs"
 ROBUST_ASINH = "robust_asinh"
 POINTWISE_MAD_ASINH = "pointwise_mad_asinh"
 
+TRAINING_POINTWISE_MEDIAN = "training_pointwise_median"
+PCA_RECONSTRUCTION = "pca_reconstruction"
+
+SUPPORTED_PRIOR_METHODS = {
+    TRAINING_POINTWISE_MEDIAN,
+    PCA_RECONSTRUCTION,
+}
+
 SUPPORTED_NORMALIZATION_METHODS = {
     GLOBAL_MAXABS,
     ROBUST_ASINH,
@@ -26,7 +34,7 @@ _PERCENTILE_LEVELS = np.asarray(
 
 @dataclass
 class PriorResidualTransformer:
-    """使用训练集逐点中位数先验，把完整光谱变换到残差域。
+    """使用固定或 PCA 可变训练集先验，把完整光谱变换到残差域。
 
     输入和输出均为二维数组 ``[N, L]``。输入光谱必须已经：
 
@@ -49,12 +57,19 @@ class PriorResidualTransformer:
         在真实高变异峰区则允许恢复成较大的残差。
     """
 
+    prior_method: str = TRAINING_POINTWISE_MEDIAN
     normalization_method: str = GLOBAL_MAXABS
     target_abs_max: float = 1.0
     residual_quantile: float = 99.5
     pointwise_scale_floor_quantile: float = 10.0
     mad_scale_factor: float = 1.4826
     epsilon: float = 1.0e-8
+
+    # D2.2: PCA可变先验的参数。仅在prior_method=pca_reconstruction时使用。
+    pca_explained_variance_ratio: float = 0.95
+    pca_max_components: int | None = None
+    pca_sampling_strategy: str = "truncated_gaussian_scores"
+    pca_score_clip_standard_deviations: float = 2.5
 
     prior: np.ndarray | None = None
 
@@ -75,7 +90,19 @@ class PriorResidualTransformer:
     training_abs_residual_percentiles: dict[str, float] | None = None
     training_pointwise_scale_percentiles: dict[str, float] | None = None
 
+    # D2.2专用状态。PCA在训练集完整归一化光谱域拟合；components每行是一个
+    # 主成分方向，training_score_mean/covariance仅用于生成端抽取新先验。
+    pca_mean: np.ndarray | None = None
+    pca_components: np.ndarray | None = None
+    pca_training_score_mean: np.ndarray | None = None
+    pca_training_score_covariance: np.ndarray | None = None
+    pca_score_standard_deviation: np.ndarray | None = None
+    pca_explained_variance: np.ndarray | None = None
+    pca_explained_variance_ratio_: np.ndarray | None = None
+    pca_number_of_training_spectra: int | None = None
+
     def __post_init__(self) -> None:
+        self.prior_method = str(self.prior_method).strip().lower()
         self.normalization_method = str(
             self.normalization_method
         ).strip().lower()
@@ -86,6 +113,27 @@ class PriorResidualTransformer:
         )
         self.mad_scale_factor = float(self.mad_scale_factor)
         self.epsilon = float(self.epsilon)
+        self.pca_explained_variance_ratio = float(
+            self.pca_explained_variance_ratio
+        )
+        self.pca_max_components = (
+            None
+            if self.pca_max_components is None
+            else int(self.pca_max_components)
+        )
+        self.pca_sampling_strategy = str(
+            self.pca_sampling_strategy
+        ).strip().lower()
+        self.pca_score_clip_standard_deviations = float(
+            self.pca_score_clip_standard_deviations
+        )
+
+        if self.prior_method not in SUPPORTED_PRIOR_METHODS:
+            supported = ", ".join(sorted(SUPPORTED_PRIOR_METHODS))
+            raise ValueError(
+                "不支持的prior_method："
+                f"{self.prior_method}。可用方法：{supported}。"
+            )
 
         if self.normalization_method not in SUPPORTED_NORMALIZATION_METHODS:
             supported = ", ".join(sorted(SUPPORTED_NORMALIZATION_METHODS))
@@ -111,6 +159,22 @@ class PriorResidualTransformer:
         if self.epsilon <= 0.0:
             raise ValueError("epsilon必须大于0。")
 
+        if not 0.0 < self.pca_explained_variance_ratio <= 1.0:
+            raise ValueError(
+                "pca_explained_variance_ratio必须在(0, 1]范围内。"
+            )
+        if self.pca_max_components is not None and self.pca_max_components <= 0:
+            raise ValueError("pca_max_components必须为正整数或null。")
+        if self.pca_sampling_strategy != "truncated_gaussian_scores":
+            raise ValueError(
+                "pca_sampling_strategy当前只支持"
+                "truncated_gaussian_scores。"
+            )
+        if self.pca_score_clip_standard_deviations <= 0.0:
+            raise ValueError(
+                "pca_score_clip_standard_deviations必须大于0。"
+            )
+
     def fit(
         self,
         training_spectra: np.ndarray,
@@ -121,10 +185,25 @@ class PriorResidualTransformer:
         if values.shape[0] < 2:
             raise ValueError("先验残差模型至少需要2条训练光谱。")
 
-        prior = np.median(values, axis=0).astype(np.float32, copy=False)
-        residuals = values.astype(np.float64, copy=False) - prior[
-            np.newaxis, :
-        ].astype(np.float64, copy=False)
+        self._clear_pca_state()
+
+        if self.prior_method == TRAINING_POINTWISE_MEDIAN:
+            prior = np.median(values, axis=0).astype(np.float32, copy=False)
+            reference_priors = np.repeat(
+                prior[np.newaxis, :],
+                values.shape[0],
+                axis=0,
+            )
+        else:
+            reference_priors = self._fit_pca_prior(values)
+            # 兼容D3.2/D3.4的checkpoint字段：这里保存PCA均值作为默认先验，
+            # 训练时实际使用的逐样本PCA重建先验会随batch传递。
+            prior = self.pca_mean.astype(np.float32, copy=False)
+
+        residuals = values.astype(np.float64, copy=False) - reference_priors.astype(
+            np.float64,
+            copy=False,
+        )
         absolute_residuals = np.abs(residuals)
         maximum = float(np.max(absolute_residuals))
 
@@ -253,16 +332,27 @@ class PriorResidualTransformer:
             description="训练标准化残差",
         )
 
-    def transform(self, spectra: np.ndarray) -> np.ndarray:
+    def transform(
+        self,
+        spectra: np.ndarray,
+        *,
+        reference_priors: np.ndarray | None = None,
+    ) -> np.ndarray:
         """将完整归一化光谱转换为DDPM学习的残差域。"""
 
         self._check_fitted()
         values = self._validate_array(spectra, "spectra")
         self._check_length(values)
 
-        residuals = values.astype(np.float64, copy=False) - self.prior[
-            np.newaxis, :
-        ].astype(np.float64, copy=False)
+        references = self._resolve_reference_priors(
+            values,
+            reference_priors=reference_priors,
+            operation="transform",
+        )
+        residuals = values.astype(np.float64, copy=False) - references.astype(
+            np.float64,
+            copy=False,
+        )
 
         if self.normalization_method == GLOBAL_MAXABS:
             scaled = residuals / float(self.residual_scale)
@@ -281,8 +371,13 @@ class PriorResidualTransformer:
 
         return scaled.astype(np.float32, copy=False)
 
-    def inverse_transform(self, scaled_residuals: np.ndarray) -> np.ndarray:
-        """取消残差变换并加回训练集逐点中位数先验。"""
+    def inverse_transform(
+        self,
+        scaled_residuals: np.ndarray,
+        *,
+        reference_priors: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """取消残差变换并加回对应的固定或 PCA 可变先验。"""
 
         self._check_fitted()
         values = self._validate_array(scaled_residuals, "scaled_residuals")
@@ -300,7 +395,12 @@ class PriorResidualTransformer:
             )
             residuals = self.pointwise_scale[np.newaxis, :] * standardized
 
-        restored = self.prior[np.newaxis, :] + residuals
+        references = self._resolve_reference_priors(
+            values,
+            reference_priors=reference_priors,
+            operation="inverse_transform",
+        )
+        restored = references + residuals
         if not np.isfinite(restored).all():
             raise RuntimeError(
                 "残差逆变换结果包含NaN或无穷值。"
@@ -325,7 +425,7 @@ class PriorResidualTransformer:
         return np.sinh(sinh_argument)
 
     def prior_batch(self, number_of_spectra: int) -> np.ndarray:
-        """返回多份训练集先验。"""
+        """返回默认先验；D2.2生成必须改用sample_reference_priors()。"""
 
         self._check_fitted()
         count = int(number_of_spectra)
@@ -337,6 +437,172 @@ class PriorResidualTransformer:
             count,
             axis=0,
         ).astype(np.float32, copy=False)
+
+    def reference_priors_for_spectra(self, spectra: np.ndarray) -> np.ndarray:
+        """为已归一化的真实光谱计算与其对应的训练阶段先验。"""
+
+        self._check_fitted()
+        values = self._validate_array(spectra, "spectra")
+        self._check_length(values)
+        return self._resolve_reference_priors(
+            values,
+            reference_priors=None,
+            operation="reference_priors_for_spectra",
+        )
+
+    def sample_reference_priors(
+        self,
+        number_of_spectra: int,
+        *,
+        random_generator: np.random.Generator,
+    ) -> np.ndarray:
+        """为生成端抽取不依赖真实样本索引的合理可变先验。
+
+        对固定中位数D2.1保持历史行为。D2.2在训练集PCA分数的多元高斯近似中
+        抽样，并逐分量截断到训练分布均值±clip×标准差，防止小样本协方差外推。
+        """
+
+        self._check_fitted()
+        count = int(number_of_spectra)
+        if count <= 0:
+            raise ValueError("number_of_spectra必须大于0。")
+        if not isinstance(random_generator, np.random.Generator):
+            raise TypeError("random_generator必须是numpy.random.Generator。")
+
+        if self.prior_method == TRAINING_POINTWISE_MEDIAN:
+            return self.prior_batch(count)
+
+        scores = random_generator.multivariate_normal(
+            mean=self.pca_training_score_mean,
+            cov=self.pca_training_score_covariance,
+            size=count,
+            check_valid="raise",
+        )
+        scores = np.asarray(scores, dtype=np.float64).reshape(
+            count,
+            self.pca_components.shape[0],
+        )
+        limit = (
+            self.pca_score_clip_standard_deviations
+            * self.pca_score_standard_deviation
+        )
+        lower = self.pca_training_score_mean - limit
+        upper = self.pca_training_score_mean + limit
+        scores = np.clip(scores, lower[np.newaxis, :], upper[np.newaxis, :])
+        priors = self.pca_mean[np.newaxis, :] + scores @ self.pca_components
+        if not np.isfinite(priors).all():
+            raise RuntimeError("PCA生成先验包含NaN或无穷值。")
+        return priors.astype(np.float32, copy=False)
+
+    def _clear_pca_state(self) -> None:
+        self.pca_mean = None
+        self.pca_components = None
+        self.pca_training_score_mean = None
+        self.pca_training_score_covariance = None
+        self.pca_score_standard_deviation = None
+        self.pca_explained_variance = None
+        self.pca_explained_variance_ratio_ = None
+        self.pca_number_of_training_spectra = None
+
+    def _fit_pca_prior(self, values: np.ndarray) -> np.ndarray:
+        """在训练集拟合PCA，并返回每条训练谱的低维重建先验。"""
+
+        values64 = values.astype(np.float64, copy=False)
+        mean = values64.mean(axis=0)
+        centered = values64 - mean[np.newaxis, :]
+        _, singular_values, right_vectors = np.linalg.svd(
+            centered,
+            full_matrices=False,
+        )
+        explained_variance_all = np.square(singular_values) / max(
+            values64.shape[0] - 1,
+            1,
+        )
+        total_variance = float(explained_variance_all.sum())
+        if total_variance <= self.epsilon:
+            raise ValueError("训练光谱总体方差几乎为零，无法拟合PCA先验。")
+
+        explained_ratio_all = explained_variance_all / total_variance
+        cumulative = np.cumsum(explained_ratio_all)
+        component_count = int(
+            np.searchsorted(
+                cumulative,
+                self.pca_explained_variance_ratio,
+                side="left",
+            )
+            + 1
+        )
+        maximum_available = min(values64.shape[0] - 1, values64.shape[1])
+        if self.pca_max_components is not None:
+            maximum_available = min(
+                maximum_available,
+                self.pca_max_components,
+            )
+        component_count = max(1, min(component_count, maximum_available))
+
+        components = right_vectors[:component_count]
+        scores = centered @ components.T
+        score_mean = scores.mean(axis=0)
+        if component_count == 1:
+            score_covariance = np.asarray(
+                [[float(np.var(scores[:, 0], ddof=1))]],
+                dtype=np.float64,
+            )
+        else:
+            score_covariance = np.cov(scores, rowvar=False, ddof=1)
+        score_covariance = np.asarray(score_covariance, dtype=np.float64)
+        diagonal = np.diag(score_covariance).copy()
+        diagonal = np.maximum(diagonal, self.epsilon**2)
+        score_covariance[np.diag_indices_from(score_covariance)] = diagonal
+        score_standard_deviation = np.sqrt(diagonal)
+        reconstructed = mean[np.newaxis, :] + scores @ components
+
+        self.pca_mean = mean.astype(np.float32, copy=False)
+        self.pca_components = components.astype(np.float32, copy=False)
+        self.pca_training_score_mean = score_mean.astype(np.float64, copy=False)
+        self.pca_training_score_covariance = score_covariance
+        self.pca_score_standard_deviation = score_standard_deviation
+        self.pca_explained_variance = explained_variance_all[:component_count]
+        self.pca_explained_variance_ratio_ = explained_ratio_all[:component_count]
+        self.pca_number_of_training_spectra = int(values64.shape[0])
+        return reconstructed.astype(np.float32, copy=False)
+
+    def _resolve_reference_priors(
+        self,
+        values: np.ndarray,
+        *,
+        reference_priors: np.ndarray | None,
+        operation: str,
+    ) -> np.ndarray:
+        """规范化或自动计算每条光谱的参考先验。"""
+
+        if reference_priors is not None:
+            references = self._validate_array(
+                reference_priors,
+                "reference_priors",
+            )
+            if references.shape != values.shape:
+                raise ValueError(
+                    "reference_priors形状必须与光谱一致："
+                    f"先验为{references.shape}，光谱为{values.shape}。"
+                )
+            return references.astype(np.float32, copy=False)
+
+        if self.prior_method == TRAINING_POINTWISE_MEDIAN:
+            return self.prior_batch(values.shape[0])
+
+        if operation == "inverse_transform":
+            raise ValueError(
+                "D2.2 PCA可变先验的inverse_transform必须显式提供"
+                "reference_priors；生成端请使用sample_reference_priors()。"
+            )
+
+        centered = values.astype(np.float64, copy=False) - self.pca_mean[
+            np.newaxis, :
+        ].astype(np.float64, copy=False)
+        scores = centered @ self.pca_components.astype(np.float64, copy=False).T
+        priors = self.pca_mean[np.newaxis, :] + scores @ self.pca_components
+        return priors.astype(np.float32, copy=False)
 
     def state_dict(self) -> dict[str, Any]:
         """生成可保存到checkpoint metadata中的状态。"""
@@ -391,21 +657,45 @@ class PriorResidualTransformer:
                 }
             )
 
-        return {
-            "schema_version": 3,
+        state = {
+            "schema_version": 4,
             "enabled": True,
             "domain": "spectrum_global_minmax_normalized",
-            "prior_method": "training_pointwise_median",
+            "prior_method": self.prior_method,
             "prior_normalized_intensity": self.prior.tolist(),
             "residual_normalization": residual_state,
         }
+
+        if self.prior_method == PCA_RECONSTRUCTION:
+            state["pca_prior"] = {
+                "explained_variance_ratio_target": float(
+                    self.pca_explained_variance_ratio
+                ),
+                "max_components": self.pca_max_components,
+                "sampling_strategy": self.pca_sampling_strategy,
+                "score_clip_standard_deviations": float(
+                    self.pca_score_clip_standard_deviations
+                ),
+                "number_of_training_spectra": int(
+                    self.pca_number_of_training_spectra
+                ),
+                "mean": self.pca_mean.tolist(),
+                "components": self.pca_components.tolist(),
+                "training_score_mean": self.pca_training_score_mean.tolist(),
+                "training_score_covariance": self.pca_training_score_covariance.tolist(),
+                "score_standard_deviation": self.pca_score_standard_deviation.tolist(),
+                "explained_variance": self.pca_explained_variance.tolist(),
+                "explained_variance_ratio": self.pca_explained_variance_ratio_.tolist(),
+            }
+
+        return state
 
     @classmethod
     def from_state_dict(
         cls,
         state: dict[str, Any],
     ) -> "PriorResidualTransformer":
-        """从v1、v2或v3 checkpoint metadata恢复变换器。"""
+        """从v1–v4 checkpoint metadata恢复变换器。"""
 
         if not isinstance(state, dict):
             raise TypeError("prior_residual_state必须是字典。")
@@ -413,14 +703,19 @@ class PriorResidualTransformer:
             raise ValueError("prior_residual_state没有启用。")
 
         schema_version = int(state.get("schema_version", 0))
-        if schema_version not in {1, 2, 3}:
+        if schema_version not in {1, 2, 3, 4}:
             raise ValueError("不支持的prior_residual_state版本。")
         if state.get("domain") != "spectrum_global_minmax_normalized":
             raise ValueError("检查点中的先验残差数据域无效。")
-        if state.get("prior_method") != "training_pointwise_median":
+        prior_method = str(
+            state.get("prior_method", TRAINING_POINTWISE_MEDIAN)
+        ).strip().lower()
+        if prior_method not in SUPPORTED_PRIOR_METHODS:
             raise ValueError(
-                "检查点中的先验方法不是training_pointwise_median。"
+                "检查点中的prior_method不受支持。"
             )
+        if schema_version < 4 and prior_method != TRAINING_POINTWISE_MEDIAN:
+            raise ValueError("PCA先验必须使用v4 checkpoint状态。")
 
         residual_state = state.get("residual_normalization")
         if not isinstance(residual_state, dict):
@@ -433,6 +728,7 @@ class PriorResidualTransformer:
             raise ValueError("pointwise_mad_asinh必须使用v3检查点状态。")
 
         transformer = cls(
+            prior_method=prior_method,
             normalization_method=method,
             target_abs_max=float(residual_state["target_abs_max"]),
             residual_quantile=float(
@@ -445,6 +741,7 @@ class PriorResidualTransformer:
                 residual_state.get("mad_scale_factor", 1.4826)
             ),
             epsilon=float(residual_state.get("epsilon", 1.0e-8)),
+            **cls._pca_constructor_keywords(state, prior_method),
         )
 
         prior = np.asarray(
@@ -481,8 +778,99 @@ class PriorResidualTransformer:
         else:
             transformer._restore_pointwise_mad_asinh(residual_state)
 
+        if prior_method == PCA_RECONSTRUCTION:
+            transformer._restore_pca_prior(state)
+
         transformer._check_fitted()
         return transformer
+
+    @staticmethod
+    def _pca_constructor_keywords(
+        state: dict[str, Any],
+        prior_method: str,
+    ) -> dict[str, Any]:
+        if prior_method != PCA_RECONSTRUCTION:
+            return {}
+        pca_state = state.get("pca_prior")
+        if not isinstance(pca_state, dict):
+            raise ValueError("PCA checkpoint缺少pca_prior状态。")
+        return {
+            "pca_explained_variance_ratio": float(
+                pca_state["explained_variance_ratio_target"]
+            ),
+            "pca_max_components": pca_state.get("max_components"),
+            "pca_sampling_strategy": str(pca_state["sampling_strategy"]),
+            "pca_score_clip_standard_deviations": float(
+                pca_state["score_clip_standard_deviations"]
+            ),
+        }
+
+    def _restore_pca_prior(self, state: dict[str, Any]) -> None:
+        pca_state = state.get("pca_prior")
+        if not isinstance(pca_state, dict):
+            raise ValueError("PCA checkpoint缺少pca_prior状态。")
+
+        mean = np.asarray(pca_state["mean"], dtype=np.float32).reshape(-1)
+        components = np.asarray(pca_state["components"], dtype=np.float32)
+        score_mean = np.asarray(
+            pca_state["training_score_mean"], dtype=np.float64
+        ).reshape(-1)
+        covariance = np.asarray(
+            pca_state["training_score_covariance"], dtype=np.float64
+        )
+        score_std = np.asarray(
+            pca_state["score_standard_deviation"], dtype=np.float64
+        ).reshape(-1)
+        explained_variance = np.asarray(
+            pca_state["explained_variance"], dtype=np.float64
+        ).reshape(-1)
+        explained_ratio = np.asarray(
+            pca_state["explained_variance_ratio"], dtype=np.float64
+        ).reshape(-1)
+        if (
+            mean.size != self.prior.size
+            or components.ndim != 2
+            or components.shape[1] != self.prior.size
+            or components.shape[0] < 1
+        ):
+            raise ValueError("PCA checkpoint的均值或components长度无效。")
+        component_count = components.shape[0]
+        if (
+            score_mean.size != component_count
+            or score_std.size != component_count
+            or covariance.shape != (component_count, component_count)
+            or explained_variance.size != component_count
+            or explained_ratio.size != component_count
+        ):
+            raise ValueError("PCA checkpoint的分数统计形状无效。")
+        if (
+            not np.isfinite(mean).all()
+            or not np.isfinite(components).all()
+            or not np.isfinite(score_mean).all()
+            or not np.isfinite(covariance).all()
+            or not np.isfinite(score_std).all()
+            or np.any(score_std <= self.epsilon)
+            or np.any(explained_variance < 0.0)
+            or np.any(explained_ratio < 0.0)
+        ):
+            raise ValueError("PCA checkpoint包含无效数值。")
+        if not np.allclose(mean, self.prior, rtol=1.0e-5, atol=self.epsilon):
+            raise ValueError("PCA checkpoint的默认先验与PCA均值不一致。")
+        if not np.allclose(covariance, covariance.T, rtol=1.0e-5, atol=self.epsilon):
+            raise ValueError("PCA checkpoint的score covariance必须对称。")
+
+        self.pca_mean = mean.copy()
+        self.pca_components = components.copy()
+        self.pca_training_score_mean = score_mean.copy()
+        self.pca_training_score_covariance = covariance.copy()
+        self.pca_score_standard_deviation = score_std.copy()
+        self.pca_explained_variance = explained_variance.copy()
+        self.pca_explained_variance_ratio_ = explained_ratio.copy()
+        self.pca_number_of_training_spectra = int(
+            pca_state["number_of_training_spectra"]
+        )
+        if self.pca_number_of_training_spectra < 2:
+            raise ValueError("PCA checkpoint训练光谱数量至少应为2。")
 
     def _restore_global_maxabs(self, residual_state: dict[str, Any]) -> None:
         scale = float(residual_state["scale"])
@@ -731,7 +1119,26 @@ class PriorResidualTransformer:
             )
         )
 
-        if not base_fitted or not robust_fitted or not pointwise_fitted:
+        pca_fitted = (
+            self.prior_method != PCA_RECONSTRUCTION
+            or (
+                self.pca_mean is not None
+                and self.pca_components is not None
+                and self.pca_training_score_mean is not None
+                and self.pca_training_score_covariance is not None
+                and self.pca_score_standard_deviation is not None
+                and self.pca_explained_variance is not None
+                and self.pca_explained_variance_ratio_ is not None
+                and self.pca_number_of_training_spectra is not None
+            )
+        )
+
+        if (
+            not base_fitted
+            or not robust_fitted
+            or not pointwise_fitted
+            or not pca_fitted
+        ):
             raise RuntimeError("先验残差变换器尚未使用训练集fit()。")
 
     def _check_length(self, values: np.ndarray) -> None:

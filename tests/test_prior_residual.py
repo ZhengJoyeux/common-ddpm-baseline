@@ -138,7 +138,7 @@ def test_checkpoint_round_trip(method: str) -> None:
     ).fit(spectra)
 
     state = original.state_dict()
-    assert state["schema_version"] == 3
+    assert state["schema_version"] == 4
     assert state["residual_normalization"]["method"] == method
 
     if method == "pointwise_mad_asinh":
@@ -214,3 +214,50 @@ def test_pointwise_checkpoint_rejects_wrong_scale_length() -> None:
 
     with pytest.raises(ValueError, match="长度与先验不一致"):
         PriorResidualTransformer.from_state_dict(state)
+
+
+def test_pca_variable_prior_is_reversible_and_samples_new_priors() -> None:
+    spectra = _build_heteroscedastic_spectra()
+    transformer = PriorResidualTransformer(
+        prior_method="pca_reconstruction",
+        normalization_method="pointwise_mad_asinh",
+        pca_explained_variance_ratio=0.90,
+        pca_max_components=6,
+    ).fit(spectra)
+
+    reference_priors = transformer.reference_priors_for_spectra(spectra)
+    transformed = transformer.transform(
+        spectra,
+        reference_priors=reference_priors,
+    )
+    restored = transformer.inverse_transform(
+        transformed,
+        reference_priors=reference_priors,
+    )
+
+    assert transformer.pca_components.shape[0] <= 6
+    assert reference_priors.shape == spectra.shape
+    np.testing.assert_allclose(restored, spectra, rtol=2.0e-5, atol=2.0e-6)
+
+    with pytest.raises(ValueError, match="必须显式提供"):
+        transformer.inverse_transform(transformed)
+
+    sampled = transformer.sample_reference_priors(
+        5,
+        random_generator=np.random.default_rng(2026),
+    )
+    assert sampled.shape == (5, spectra.shape[1])
+    assert np.isfinite(sampled).all()
+
+    state = transformer.state_dict()
+    assert state["schema_version"] == 4
+    restored_transformer = PriorResidualTransformer.from_state_dict(state)
+    np.testing.assert_allclose(
+        restored_transformer.inverse_transform(
+            transformed,
+            reference_priors=reference_priors,
+        ),
+        spectra,
+        rtol=2.0e-5,
+        atol=2.0e-6,
+    )

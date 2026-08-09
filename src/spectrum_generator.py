@@ -9,6 +9,9 @@ from torch import nn
 from src.prior_residual import (
     PriorResidualTransformer,
 )
+from src.feature_peak_residual_limiter import (
+    FeaturePeakResidualLimiter,
+)
 from src.spectrum_length_adapter import (
     SpectrumLengthAdapter,
 )
@@ -26,6 +29,10 @@ def generate_spectra(
     prior_residual_transformer: (
         PriorResidualTransformer | None
     ) = None,
+    feature_peak_residual_limiter: (
+        FeaturePeakResidualLimiter | None
+    ) = None,
+    prior_random_seed: int | None = None,
 ) -> np.ndarray:
     """
     分批生成光谱。
@@ -43,6 +50,14 @@ def generate_spectra(
     if generation_batch_size <= 0:
         raise ValueError(
             "generation_batch_size必须大于0。"
+        )
+
+    if (
+        feature_peak_residual_limiter is not None
+        and prior_residual_transformer is None
+    ):
+        raise ValueError(
+            "D3.5特征峰残差软上限必须与D2先验残差变换器一起使用。"
         )
 
     target_axis: np.ndarray | None = None
@@ -72,6 +87,8 @@ def generate_spectra(
 
     diffusion = diffusion.to(device)
     diffusion.eval()
+
+    prior_random_generator = np.random.default_rng(prior_random_seed)
 
     generated_batches: list[np.ndarray] = []
     number_generated = 0
@@ -128,11 +145,32 @@ def generate_spectra(
             prior_residual_transformer
             is not None
         ):
+            reference_priors = None
+            if (
+                prior_residual_transformer.prior_method
+                == "pca_reconstruction"
+            ):
+                reference_priors = (
+                    prior_residual_transformer.sample_reference_priors(
+                        current_batch_size,
+                        random_generator=prior_random_generator,
+                    )
+                )
             restored = (
                 prior_residual_transformer
                 .inverse_transform(
-                    restored
+                    restored,
+                    reference_priors=reference_priors,
                 )
+            )
+
+        # D3.5：先恢复到完整归一化光谱，再相对训练集先验
+        # 只软限制自动识别的特征峰窗口中的残差幅度。
+        # 此步骤必须发生在轴插值和全局反归一化之前。
+        if feature_peak_residual_limiter is not None:
+            restored = (
+                feature_peak_residual_limiter
+                .apply_to_normalized_spectra(restored)
             )
 
         # 如果指定了标签或模板文件的原始位移轴，

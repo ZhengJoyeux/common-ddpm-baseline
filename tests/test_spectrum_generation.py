@@ -293,3 +293,47 @@ def test_d2_generation_restores_prior_residual():
         rtol=1.0e-6,
         atol=1.0e-6,
     )
+
+
+def test_d2_2_generation_uses_sampled_pca_priors():
+    model_axis = np.arange(5, dtype=np.float64)
+    training_spectra = np.asarray(
+        [
+            [-0.8, -0.4, 0.0, 0.4, 0.8],
+            [-0.5, -0.2, 0.2, 0.5, 0.7],
+            [-0.3, 0.1, 0.4, 0.7, 0.6],
+            [-0.6, -0.1, 0.1, 0.6, 0.5],
+        ],
+        dtype=np.float32,
+    )
+    transformer = PriorResidualTransformer(
+        prior_method="pca_reconstruction",
+        normalization_method="pointwise_mad_asinh",
+        pca_explained_variance_ratio=0.90,
+        pca_max_components=2,
+    ).fit(training_spectra)
+    adapter = SpectrumLengthAdapter.create(
+        dimension_multipliers=[1, 2, 4],
+        raman_shifts=[model_axis],
+        model_length="auto",
+        padding_mode="right_zero_padding",
+        padding_value=0.0,
+        raman_range_tolerance=1.0,
+    )
+    fixed_diffusion = FixedSampleDiffusion(
+        np.zeros((3, adapter.padded_length), dtype=np.float32)
+    )
+    expected = transformer.sample_reference_priors(
+        3,
+        random_generator=np.random.default_rng(2026),
+    )
+    generated = generate_spectra(
+        diffusion=fixed_diffusion,
+        number_of_spectra=3,
+        generation_batch_size=2,
+        device=torch.device("cpu"),
+        length_adapter=adapter,
+        prior_residual_transformer=transformer,
+        prior_random_seed=2026,
+    )
+    np.testing.assert_allclose(generated, expected, rtol=1.0e-6, atol=1.0e-6)

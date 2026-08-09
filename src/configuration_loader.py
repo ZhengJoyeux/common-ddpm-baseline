@@ -1,5 +1,3 @@
-"""读取、解析并校验项目 YAML 配置。"""
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -7,6 +5,12 @@ from typing import Any
 
 import yaml
 
+from src.sers_diversity_constraints import (
+    normalize_diversity_configuration,
+)
+from src.feature_peak_residual_limiter import (
+    normalize_feature_peak_residual_limiter_configuration,
+)
 from src.sers_physics_constraints import (
     normalize_physics_configuration,
 )
@@ -307,16 +311,63 @@ def _validate_diffusion_configuration(
         diffusion.get("loss_weighting", "library_default")
     ).strip().lower()
 
-    if loss_weighting not in {"library_default", "snr", "uniform"}:
+    if loss_weighting not in {
+        "library_default",
+        "snr",
+        "uniform",
+        "high_noise",
+    }:
         raise ValueError(
             "diffusion.loss_weighting必须为"
-            "library_default、snr或uniform。"
+            "library_default、snr、uniform或high_noise。"
         )
 
     if loss_weighting == "snr" and objective != "pred_x0":
         raise ValueError(
             "diffusion.loss_weighting=snr目前只允许用于pred_x0。"
         )
+
+    if loss_weighting == "high_noise":
+        high_noise = diffusion.get("high_noise", {})
+
+        if high_noise is None:
+            high_noise = {}
+
+        if not isinstance(high_noise, dict):
+            raise TypeError(
+                "diffusion.high_noise必须是字典。"
+            )
+
+        minimum_weight = float(
+            high_noise.get("minimum_weight", 0.50)
+        )
+        maximum_weight = float(
+            high_noise.get("maximum_weight", 2.00)
+        )
+        ramp_power = float(
+            high_noise.get("ramp_power", 1.0)
+        )
+
+        if minimum_weight <= 0.0:
+            raise ValueError(
+                "diffusion.high_noise.minimum_weight必须大于0。"
+            )
+
+        if maximum_weight <= minimum_weight:
+            raise ValueError(
+                "diffusion.high_noise.maximum_weight必须大于"
+                "minimum_weight。"
+            )
+
+        if ramp_power <= 0.0:
+            raise ValueError(
+                "diffusion.high_noise.ramp_power必须大于0。"
+            )
+
+        high_noise["minimum_weight"] = minimum_weight
+        high_noise["maximum_weight"] = maximum_weight
+        high_noise["ramp_power"] = ramp_power
+        diffusion["high_noise"] = high_noise
 
 
 def _validate_prior_residual_configuration(
@@ -337,13 +388,63 @@ def _validate_prior_residual_configuration(
     )
 
     if prior_residual["enabled"]:
-        if prior_residual.get(
-            "prior_method",
-            "training_pointwise_median",
-        ) != "training_pointwise_median":
-            raise ValueError(
-                "当前只支持prior_method=training_pointwise_median。"
+        prior_method = str(
+            prior_residual.get(
+                "prior_method",
+                "training_pointwise_median",
             )
+        ).strip().lower()
+        if prior_method not in {
+            "training_pointwise_median",
+            "pca_reconstruction",
+        }:
+            raise ValueError(
+                "prior_residual.prior_method必须为"
+                "training_pointwise_median或pca_reconstruction。"
+            )
+        prior_residual["prior_method"] = prior_method
+
+        if prior_method == "pca_reconstruction":
+            explained_ratio = float(
+                prior_residual.get("pca_explained_variance_ratio", 0.95)
+            )
+            if not 0.0 < explained_ratio <= 1.0:
+                raise ValueError(
+                    "prior_residual.pca_explained_variance_ratio"
+                    "必须在(0,1]范围内。"
+                )
+            max_components = prior_residual.get("pca_max_components")
+            if max_components is not None and int(max_components) <= 0:
+                raise ValueError(
+                    "prior_residual.pca_max_components"
+                    "必须为正整数或null。"
+                )
+            sampling_strategy = str(
+                prior_residual.get(
+                    "pca_sampling_strategy",
+                    "truncated_gaussian_scores",
+                )
+            ).strip().lower()
+            if sampling_strategy != "truncated_gaussian_scores":
+                raise ValueError(
+                    "prior_residual.pca_sampling_strategy当前只支持"
+                    "truncated_gaussian_scores。"
+                )
+            score_clip = float(
+                prior_residual.get(
+                    "pca_score_clip_standard_deviations",
+                    2.5,
+                )
+            )
+            if score_clip <= 0.0:
+                raise ValueError(
+                    "prior_residual.pca_score_clip_standard_deviations"
+                    "必须大于0。"
+                )
+            prior_residual["pca_explained_variance_ratio"] = explained_ratio
+            prior_residual["pca_max_components"] = max_components
+            prior_residual["pca_sampling_strategy"] = sampling_strategy
+            prior_residual["pca_score_clip_standard_deviations"] = score_clip
 
         method = str(
             prior_residual.get(
@@ -369,12 +470,12 @@ def _validate_prior_residual_configuration(
     return prior_residual
 
 
-def _validate_physics_configuration(
+def _validate_d3_configuration(
     configuration: dict[str, Any],
     *,
     prior_residual: dict[str, Any],
 ) -> None:
-    """校验 D3.1 与 D2.1、pred_x0 和归一化流程的一致性。"""
+    """校验 D3.4 约束与 D2.1、pred_x0 和归一化流程的一致性。"""
 
     raw_physics = configuration.get(
         "physics_constraints",
@@ -384,26 +485,70 @@ def _validate_physics_configuration(
     if raw_physics is None:
         raw_physics = {"enabled": False}
 
+    if "distribution_preservation" in raw_physics:
+        raise ValueError(
+            "D3.4不再支持physics_constraints.distribution_preservation。"
+            "请删除该区段，并使用顶层diversity_constraints。"
+        )
+
     physics = normalize_physics_configuration(raw_physics)
     configuration["physics_constraints"] = physics
 
-    if not bool(physics.get("enabled", False)):
+    raw_diversity = configuration.get(
+        "diversity_constraints",
+        {"enabled": False},
+    )
+
+    if raw_diversity is None:
+        raw_diversity = {"enabled": False}
+
+    diversity = normalize_diversity_configuration(raw_diversity)
+    configuration["diversity_constraints"] = diversity
+
+    raw_limiter = configuration.get(
+        "feature_peak_residual_limiter",
+        {"enabled": False},
+    )
+
+    if raw_limiter is None:
+        raw_limiter = {"enabled": False}
+
+    limiter = normalize_feature_peak_residual_limiter_configuration(
+        raw_limiter
+    )
+    configuration["feature_peak_residual_limiter"] = limiter
+
+    if not bool(physics.get("enabled", False)) and not bool(
+        diversity.get("enabled", False)
+    ) and not bool(limiter.get("enabled", False)):
         return
 
+    if bool(limiter.get("enabled", False)) and prior_residual.get(
+        "prior_method"
+    ) == "pca_reconstruction":
+        raise ValueError(
+            "D3.5 feature_peak_residual_limiter当前只支持固定中位数先验；"
+            "D2.2 PCA可变先验实验中必须保持其enabled=false。"
+        )
+
     if not bool(prior_residual.get("enabled", False)):
-        raise ValueError("启用D3.1时必须同时启用prior_residual。")
+        raise ValueError(
+            "启用physics_constraints、diversity_constraints或"
+            "feature_peak_residual_limiter时，"
+            "必须同时启用prior_residual。"
+        )
 
     if prior_residual.get("residual_normalization") != (
         "pointwise_mad_asinh"
     ):
         raise ValueError(
-            "D3.1当前要求"
+            "D3.4当前要求"
             "prior_residual.residual_normalization="
             "pointwise_mad_asinh。"
         )
 
     if not bool(configuration["normalization"]["enabled"]):
-        raise ValueError("启用D3.1时必须启用global_minmax归一化。")
+        raise ValueError("启用D3.4时必须启用global_minmax归一化。")
 
     if not bool(
         configuration["normalization"].get(
@@ -412,16 +557,16 @@ def _validate_physics_configuration(
         )
     ):
         raise ValueError(
-            "启用D3.1时normalization.save_in_checkpoint必须为true。"
+            "启用D3.4时normalization.save_in_checkpoint必须为true。"
         )
 
     if str(
         configuration["diffusion"]["objective"]
     ).strip().lower() != "pred_x0":
-        raise ValueError("D3.1当前只支持diffusion.objective=pred_x0。")
+        raise ValueError("D3.4当前只支持diffusion.objective=pred_x0。")
 
     if bool(configuration["diffusion"]["auto_normalize"]):
-        raise ValueError("启用D3.1时diffusion.auto_normalize必须为false。")
+        raise ValueError("启用D3.4时diffusion.auto_normalize必须为false。")
 
 
 def validate_config(configuration: dict[str, Any]) -> None:
@@ -439,7 +584,7 @@ def validate_config(configuration: dict[str, Any]) -> None:
     _validate_diffusion_configuration(diffusion)
 
     prior_residual = _validate_prior_residual_configuration(configuration)
-    _validate_physics_configuration(
+    _validate_d3_configuration(
         configuration,
         prior_residual=prior_residual,
     )

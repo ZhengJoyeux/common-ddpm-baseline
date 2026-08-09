@@ -159,8 +159,6 @@ def build_axis_metadata(
             label
         ]
 
-        # 优先选择源文件数量最多的位移轴。
-        # 文件数相同时，选择点数更多的位移轴。
         default_profile_id = sorted(
             profiles,
             key=lambda current_id: (
@@ -395,7 +393,6 @@ class CheckpointManager:
                 "step不能小于0。"
             )
 
-        # 检查metadata基本格式。
         if not isinstance(
             metadata,
             dict,
@@ -404,8 +401,6 @@ class CheckpointManager:
                 "metadata必须是字典。"
             )
 
-        # 如果包含自适应位移轴信息，
-        # 检查其中是否具有有效的标签映射。
         if "axis_metadata" in metadata:
             axis_metadata = metadata[
                 "axis_metadata"
