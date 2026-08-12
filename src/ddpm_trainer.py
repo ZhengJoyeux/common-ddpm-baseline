@@ -260,11 +260,8 @@ class DdpmTrainer:
                 False,
             )
         ):
-            raise RuntimeError(
-                "当前扩散模型不支持D2.2逐样本PCA先验。"
-                "请同时启用D3 physics_constraints或"
-                "diversity_constraints，并使用D2.2完整代码。"
-            )
+            return self.diffusion(spectrum)
+
         return self.diffusion(
             spectrum,
             constraint_reference_prior=constraint_reference_prior,

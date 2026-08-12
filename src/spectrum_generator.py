@@ -15,6 +15,9 @@ from src.feature_peak_residual_limiter import (
 from src.spectrum_length_adapter import (
     SpectrumLengthAdapter,
 )
+from src.sers_sampling_calibrator import (
+    SersSamplingCalibrator,
+)
 
 
 @torch.inference_mode()
@@ -33,6 +36,10 @@ def generate_spectra(
         FeaturePeakResidualLimiter | None
     ) = None,
     prior_random_seed: int | None = None,
+    variation_scale: float = 1.0,
+    sampling_calibrator: (
+        SersSamplingCalibrator | None
+    ) = None,
 ) -> np.ndarray:
     """
     分批生成光谱。
@@ -59,6 +66,55 @@ def generate_spectra(
         raise ValueError(
             "D3.5特征峰残差软上限必须与D2先验残差变换器一起使用。"
         )
+
+    variation_scale = float(variation_scale)
+
+    if (
+        not np.isfinite(variation_scale)
+        or variation_scale <= 0.0
+        or variation_scale > 1.0
+    ):
+        raise ValueError(
+            "variation_scale必须位于(0, 1]范围内。"
+        )
+
+    variation_center: np.ndarray | None = None
+
+    if variation_scale < 1.0:
+        if prior_residual_transformer is None:
+            raise ValueError(
+                "variation_scale小于1时，必须启用"
+                "prior_residual_transformer。"
+            )
+
+        if (
+            prior_residual_transformer.prior_method
+            != "pca_reconstruction"
+        ):
+            raise ValueError(
+                "当前variation_scale校准只支持"
+                "pca_reconstruction先验。"
+            )
+
+        if prior_residual_transformer.pca_mean is None:
+            raise RuntimeError(
+                "checkpoint中的PCA状态缺少pca_mean。"
+            )
+
+        variation_center = np.asarray(
+            prior_residual_transformer.pca_mean,
+            dtype=np.float32,
+        ).reshape(-1)
+
+        if variation_center.size < 2:
+            raise RuntimeError(
+                "checkpoint中的pca_mean长度无效。"
+            )
+
+        if not np.isfinite(variation_center).all():
+            raise RuntimeError(
+                "checkpoint中的pca_mean包含NaN或无穷值。"
+            )
 
     target_axis: np.ndarray | None = None
 
@@ -164,6 +220,36 @@ def generate_spectra(
                 )
             )
 
+        # D2.5最终生成离散度校准：
+        # 完整归一化光谱重建完成后，以checkpoint中训练集
+        # 拟合的PCA均值谱为中心，温和收缩样本间离散度。
+        # 不进行平滑，也不写死任何特征峰位置。
+        if variation_center is not None:
+            if restored.ndim != 2:
+                raise RuntimeError(
+                    "离散度校准要求光谱数组为[N,L]，"
+                    f"实际形状为{restored.shape}。"
+                )
+
+            if restored.shape[1] != variation_center.size:
+                raise RuntimeError(
+                    "重建光谱与PCA均值谱长度不一致："
+                    f"{restored.shape[1]} != "
+                    f"{variation_center.size}。"
+                )
+
+            restored = (
+                variation_center[np.newaxis, :]
+                + variation_scale
+                * (
+                    restored
+                    - variation_center[np.newaxis, :]
+                )
+            ).astype(
+                np.float32,
+                copy=False,
+            )
+
         # D3.5：先恢复到完整归一化光谱，再相对训练集先验
         # 只软限制自动识别的特征峰窗口中的残差幅度。
         # 此步骤必须发生在轴插值和全局反归一化之前。
@@ -172,8 +258,6 @@ def generate_spectra(
                 feature_peak_residual_limiter
                 .apply_to_normalized_spectra(restored)
             )
-
-        # 如果指定了标签或模板文件的原始位移轴，
 
         # 如果指定了标签或模板文件的原始位移轴，
         # 再从统一训练轴插值回该输出轴。
@@ -227,6 +311,14 @@ def generate_spectra(
     ):
         raise RuntimeError(
             "最终生成的光谱数量与请求数量不一致。"
+        )
+
+    # D2.5 targeted sampling calibration：
+    # 在所有批次完成并恢复到最终输出轴后统一处理，
+    # 使随机峰位微漂移不受generation batch size影响。
+    if sampling_calibrator is not None:
+        generated_spectra = sampling_calibrator.apply(
+            generated_spectra
         )
 
     return generated_spectra

@@ -1,332 +1,360 @@
 project:
-  name: sers_d3_local_peak_distribution_s001_2400
+  # D2.5：
+  # 3-component stochastic PCA prior
+  # + robust_asinh residual
+  # + ordinary unconditional DDPM
+  name: d2_5_pca3_robust_asinh_s001_1200
+
   random_seed: 2026
+
+
 diagnostic_overfit:
   enabled: false
+
   spectrum_index: 0
+
   repeat_count: 50
+
+
 data:
+  # 当前仍然只做 S001 单一条件模型诊断。
+  # 不得把不同农药、浓度或基质混入当前无条件 D2.5。
   input_directory: data/input/S001
+
   recursive: false
+
   allowed_extensions:
-  - .xlsx
-  - .xls
-  - .csv
+    - .xlsx
+    - .xls
+    - .csv
+
   sheet_name: 0
+
+  # 当前 S001 CSV 第一行按实际文件格式读取。
   header_row: null
+
   raman_shift_column: 0
+
   intensity_start_column: 1
+
   require_same_raman_shift_axis: false
-  raman_shift_tolerance: 1.0e-06
+
+  raman_shift_tolerance: 1.0e-6
+
   raman_range_tolerance: 1.0
+
   original_spectrum_length: auto
+
   model_spectrum_length: auto
+
+  # 必须按照 Raman shift 轴插值，
+  # 不能按数组下标直接截断。
   length_adaptation: raman_axis_interpolation
+
   padding_mode: right_zero_padding
+
   padding_value: 0.0
+
+  # 当前 20 条 S001 的模型开发实验：
+  # 16 train / 2 validation / 2 test。
+  #
+  # 如果这20条属于同一个独立实验样品，
+  # 此划分只用于当前算法诊断，
+  # 不能用于论文中的独立泛化结论。
   split_unit: spectrum
+
   train_ratio: 0.8
+
   validation_ratio: 0.1
+
   test_ratio: 0.1
+
   shuffle: true
+
+
 normalization:
   enabled: true
+
   method: global_minmax
+
+  # 必须只使用 train 拟合。
   fit_on: train_only
+
   target_min: -1.0
+
   target_max: 1.0
+
   clip: false
+
   epsilon: 1.0e-12
+
   save_in_checkpoint: true
+
+
 prior_residual:
   enabled: true
-  prior_method: training_pointwise_median
-  residual_normalization: pointwise_mad_asinh
+
+  # ------------------------------------------------------------
+  # D2.5 核心：3主成分随机PCA prior。
+  #
+  # 训练时：
+  #   每条真实谱使用训练集PCA子空间中的自身重构作为prior；
+  #   DDPM只学习原谱相对于该低秩重构的剩余残差。
+  #
+  # 生成时：
+  #   从训练集PCA score分布采样可变prior；
+  #   再加回DDPM生成的robust_asinh残差。
+  #
+  # 峰位和峰形均由当前训练集自动学习，
+  # 不写死任何DEL、CHL或TEB特征峰位置。
+  # ------------------------------------------------------------
+
+  prior_method: pca_reconstruction
+
+  # 先按95%累计解释方差确定所需数量，
+  # 再强制最多保留3个主成分。
+  # 对当前16条训练谱，最终应显示PCA主成分数为3。
+  pca_explained_variance_ratio: 0.95
+
+  pca_max_components: 3
+
+  # 使用真正的逐主成分截断高斯采样。
+  # 旧的truncated_gaussian_scores实际是采样后clip，
+  # 会在±1.5标准差边界堆积大量prior，本轮不使用。
+  pca_sampling_strategy: independent_truncated_gaussian_scores
+
+  # 将每个PCA score限制在训练均值±1.5个标准差内，
+  # 减少小样本高斯外推产生的异常prior。
+  pca_score_clip_standard_deviations: 1.5
+
+  # ------------------------------------------------------------
+  # 必须使用 robust_asinh。
+  #
+  # 本轮固定使用robust_asinh，不能同时切换归一化方法，
+  # 保证与D2.4比较时只改变prior设计这一主要变量。
+  # ------------------------------------------------------------
+
+  residual_normalization: robust_asinh
+
   residual_quantile: 99.5
-  mad_scale_factor: 1.4826
-  pointwise_scale_floor_quantile: 10.0
+
   target_abs_max: 1.0
-  epsilon: 1.0e-08
+
+  epsilon: 1.0e-8
+
+  # 以下两个字段仅为旧D2.1配置兼容保留，
+  # 当前robust_asinh不使用。
+  mad_scale_factor: 1.4826
+
+  pointwise_scale_floor_quantile: 10.0
+
+
+# ==============================================================
+# D3模块
+#
+# 本轮必须全部关闭。
+#
+# 我们当前只验证：
+#
+# training-set PCA fit
+#       ↓
+# 3-component variable reconstruction prior
+#       ↓
+# robust_asinh residual
+#       ↓
+# ordinary DDPM
+#
+# 不能同时混入D3，否则无法判断D2.4是否有效。
+# ==============================================================
+
 physics_constraints:
-  enabled: true
-  strategy: target_adaptive_peak_morphology
-  total_weight: 1.0e-06
-  calculation_domain: restored_global_minmax_normalized_spectrum
-  inverse_transform:
-    numerical_safety_limit: 15.0
-  timestep_weighting:
-    mode: sqrt_alpha_cumprod
-    minimum_weight: 0.0
-    pathology_minimum_weight: 0.05
-  peak_detection:
-    smoothing_sigma_cm1: 2.0
-    local_maximum_radius_cm1: 4.0
-    prominence_radius_cm1: 12.0
-    minimum_peak_separation_cm1: 10.0
-    analysis_half_width_cm1: 20.0
-    maximum_peaks_per_spectrum: 12
-    minimum_relative_prominence: 0.08
-    minimum_prominence_noise_multiplier: 4.0
-    training_prominence_floor_quantile: 25.0
-    minimum_absolute_prominence: 0.0001
-    edge_exclusion_cm1: 24.0
-    positive_softplus_temperature: 0.01
-    epsilon: 1.0e-08
-  peak_position:
-    zero_penalty_tolerance_cm1: 5.0
-    transition_width_cm1: 5.0
-  peak_width:
-    narrow_relative_tolerance: 0.3
-    broad_relative_tolerance: 0.5
-    absolute_tolerance_cm1: 1.5
-    transition_fraction: 0.25
-    narrow_penalty_multiplier: 2.5
-    broad_penalty_multiplier: 0.5
-  peak_sharpness:
-    upper_relative_tolerance: 0.25
-    transition_fraction: 0.2
-  peak_presence:
-    minimum_area_ratio: 0.45
-    transition_fraction: 0.25
-  local_shape:
-    profile_tolerance: 0.1
-    first_derivative_tolerance: 0.25
-    second_derivative_tolerance: 0.3
-    unimodality_tolerance: 0.05
-    total_variation_tolerance: 0.2
-    target_support_fraction: 0.08
-    transition_fraction: 0.2
-    profile_weight: 0.0
-    first_derivative_weight: 0.0
-    second_derivative_weight: 0.0
-    unimodality_weight: 2.0
-    total_variation_weight: 1.0
-  training_peak_distribution:
-    enabled: true
-    maximum_reference_peaks: 10
-    minimum_relative_prominence: 0.05
-    training_prominence_floor_multiplier: 0.5
-    analysis_half_width_cm1: 30.0
-    maximum_absolute_shift_cm1: 5.0
-    shift_transition_cm1: 1.0
-    coherence_tolerance_cm1: 1.0
-    coherence_transition_cm1: 0.5
-    apex_softmax_temperature_fraction: 0.05
-    height_lower_quantile: 5.0
-    height_upper_quantile: 95.0
-    height_mad_margin_multiplier: 0.5
-    height_transition_fraction: 0.2
-    width_lower_quantile: 5.0
-    width_upper_quantile: 95.0
-    width_mad_margin_multiplier: 0.75
-    width_transition_fraction: 0.2
-  negative_valley:
-    enabled: false
-    noise_margin_multiplier: 4.0
-    minimum_margin_fraction: 0.02
-    center_weight_sigma_fraction: 0.4
-    transition_fraction: 0.2
-    weight_within_extreme: 2.0
-  pathology_aggregation:
-    mean_weight: 0.2
-    topk_weight: 0.8
-    topk_fraction: 0.01
-  roughness:
-    first_derivative_quantile: 99.5
-    second_derivative_quantile: 99.5
-    limit_multiplier: 1.15
-    first_transition_fraction: 0.2
-    second_transition_fraction: 0.2
-    first_derivative_weight: 1.0
-    second_derivative_weight: 1.5
-  pointwise_envelope:
-    enabled: true
-    lower_quantile: 20.0
-    upper_quantile: 100.0
-    mad_margin_multiplier: 1.0
-    transition_fraction: 0.2
-  extreme_intensity:
-    lower_margin_fraction: 0.02
-    upper_margin_fraction: 0.02
-    transition_fraction: 0.08
-  scaled_residual_guard:
-    enabled: false
-    absolute_quantile: 99.5
-    limit_multiplier: 1.05
-    transition_fraction: 0.15
-  component_weights:
-    position: 0.0
-    width: 0.0
-    sharpness: 0.0
-    presence: 0.0
-    local_shape: 0.0
-    stable_peak_shift: 1.0e-12
-    stable_peak_coherence: 0.0
-    stable_peak_height: 0.0
-    stable_peak_width: 0.0
-    roughness: 0.0
-    extreme: 1.0
-    scaled_residual_guard: 0.0
+  enabled: false
+
+
 diversity_constraints:
   enabled: false
-  strategy: low_noise_pairwise_residual_geometry
-  total_weight: 0.01
-  epsilon: 1.0e-08
-  low_noise_gate:
-    minimum_alpha_cumprod: 0.5
-    minimum_samples: 4
-  high_frequency_filter:
-    smoothing_sigma_points: 1.0
-    kernel_truncate: 3.0
-    distance_reference_quantile: 50.0
-    correlation_reference_quantile: 90.0
-  pairwise_distance:
-    enabled: true
-    metric: whitened_l2
-    minimum_distance_ratio: 0.5
-    maximum_distance_ratio: 1.5
-    transition_fraction: 0.2
-    weight: 1.0
-  pairwise_correlation:
-    enabled: true
-    maximum_excess_correlation: 0.01
-    transition_fraction: 0.2
-    weight: 0.5
-  pointwise_variance_floor:
-    enabled: true
-    active_std_quantile: 20.0
-    minimum_std_ratio: 0.25
-    maximum_std_ratio: 1.4
-    reference_std_floor_fraction: 0.25
-    weight: 0.2
-  peak_morphology:
-    enabled: false
-    weight: 1.0
+
+
 feature_peak_residual_limiter:
   enabled: false
+
+
+local_peak_distribution_constraints:
+  enabled: false
+
+
 model:
   channels: 1
+
   model_dimension: 16
+
   dimension_multipliers:
-  - 1
-  - 2
-  - 4
+    - 1
+    - 2
+    - 4
+
   dropout: 0.0
+
   self_condition: false
+
+  # 保留历史兼容字段。
   diffusion_timesteps: 100
+
   sampling_timesteps: 50
+
   objective: pred_x0
+
   beta_schedule: cosine
+
   ddim_sampling_eta: 0.0
+
   auto_normalize: false
+
+
 diffusion:
   diffusion_steps: 100
+
   sampling_steps: 50
+
   objective: pred_x0
+
   beta_schedule: cosine
+
   ddim_sampling_eta: 0.0
+
+  # 项目外部已经完成global_minmax，
+  # 必须关闭第三方库自动归一化。
   auto_normalize: false
+
+  # 与前面 D2 对照保持一致。
   loss_weighting: uniform
+
+  # 当前关闭。
   residual_aware_loss:
     enabled: false
-    reference_quantile: 0.9
-    strength: 2.0
-    power: 1.0
-    maximum_relative_magnitude: 3.0
-    minimum_reference_scale: 0.02
-    normalize_per_sample: true
+
+
 training:
   device: cuda
+
+  # 当前 S001：
+  # train约16条。
   batch_size: 8
-  number_of_epochs: 1200
+
+  # 约2 step / epoch。
+  # 600 epoch ≈ 1200 optimizer steps。
+  number_of_epochs: 600
+
   learning_rate: 0.0001
+
   weight_decay: 0.0
+
   number_of_workers: 0
+
   pin_memory: true
+
   drop_last: false
-  validate_every_epochs: 100
-  save_every_epochs: 150
+
+  # 50 epoch × 约2 step
+  # ≈ 每100 step验证一次。
+  validate_every_epochs: 50
+
+  # ≈ 每100 step保存一次，
+  # 不再像上次那样每10 step保存。
+  save_every_epochs: 50
+
   log_every_batches: 1
+
   gradient_accumulation_steps: 1
+
   maximum_gradient_norm: 1.0
+
   use_mixed_precision: false
+
   ema_decay: 0.995
+
   ema_update_every: 1
+
   maximum_validation_batches: 0
+
   validation_random_seed: 2026001
+
+
 output:
-  output_directory: outputs/experiments/d3_local_peak_distribution_s001_2400
-  checkpoint_directory: outputs/experiments/d3_local_peak_distribution_s001_2400/checkpoints
-  log_directory: outputs/experiments/d3_local_peak_distribution_s001_2400/logs
-  generated_spectrum_directory: outputs/experiments/d3_local_peak_distribution_s001_2400/generated/compare_step2400_latest_ddim50_ema
-  preview_plot_directory: outputs/experiments/d3_local_peak_distribution_s001_2400/plots
+  output_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200
+
+  checkpoint_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/checkpoints
+
+  log_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/logs
+
+  generated_spectrum_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/generated/ddim50_ema_targeted_calibration
+
+  preview_plot_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/plots/ddim50_ema_targeted_calibration
+
   latest_checkpoint_name: latest.pt
+
   best_checkpoint_name: best.pt
+
   training_log_name: training_log.csv
+
   split_assignment_name: split_assignment.csv
+
+
 generation:
   number_of_spectra: 100
+
   batch_size: 10
+
   model_source: ema
+
   crop_to_original_length: true
+
   inverse_normalize: true
+
+  # 不再对整条光谱做统一0.90收缩。
+  # 统一收缩会同时压小峰位、峰形和峰强差异，
+  # 不能针对性解决非峰区杂讯带过宽的问题。
+  variation_scale: 1.00
+
+  # D2.5生成阶段定向校准，不修改best.pt，也不重新训练。
+  # 所有峰区均从checkpoint中的训练集PCA均值谱自动检测，
+  # 不写死任何农药或特征峰位置。
+  sampling_calibration:
+    enabled: true
+
+    # 只压缩非峰区的宽杂讯成分；自动识别出的峰区保持原样。
+    non_peak_noise:
+      enabled: true
+
+      # 用于从PCA均值谱分离缓慢基线并自动找峰。
+      reference_smoothing_sigma_cm1: 30.0
+      minimum_relative_prominence: 0.06
+      minimum_peak_distance_cm1: 12.0
+      maximum_peak_count: 20
+
+      # 峰中心左右24 cm^-1完全保护，随后6 cm^-1平滑过渡。
+      peak_protection_half_width_cm1: 24.0
+      transition_width_cm1: 6.0
+
+      # 非峰区分解为：
+      # broad + middle + fine。
+      # middle主要对应底部较宽的波动，因此压到0.55；
+      # fine保留0.85，避免把真实SERS细噪声全部抹平。
+      fine_sigma_cm1: 1.5
+      broad_sigma_cm1: 7.0
+      middle_component_scale: 0.55
+      fine_component_scale: 0.85
+
+    # 对每条完整光谱施加一个共同轴漂移：
+    # 同一条谱的全部峰一起移动，峰间距保持不变。
+    raman_shift_jitter:
+      enabled: true
+      distribution: truncated_normal
+      standard_deviation_cm1: 3.0
+      maximum_absolute_shift_cm1: 5.0
+
   output_filename: generated_spectra.xlsx
+
   output_formats:
-  - xlsx
-  - csv
-random:
-  seed: 2026
-  deterministic: false
-local_peak_distribution_constraints:
-  enabled: true
-  epsilon: 1.0e-08
-  numerical_safety_limit: 15.0
-  minimum_batch_samples: 3
-  maximum_total_ratio_to_ddpm: 0.2
-  low_noise_gate:
-    full_weight_max_timestep: 20
-    zero_weight_min_timestep: 45
-  stable_peak_filter:
-    maximum_position_std_cm1: 2.0
-    minimum_height_median: 0.05
-  peak_window:
-    edge_fraction: 0.12
-    softplus_temperature_fraction: 0.01
-  wing_shape_tracking:
-    enabled: true
-    weight: 0.0008
-    lower_profile_fraction: 0.15
-    upper_profile_fraction: 0.7
-  negative_tail:
-    enabled: true
-    weight: 0.006
-    transition_fraction: 0.03
-    minimum_timestep_weight: 0.05
-    mean_weight: 0.2
-    topk_weight: 0.8
-    topk_fraction: 0.01
-  wing_dispersion:
-    enabled: true
-    weight: 0.0015
-    lower_profile_fraction: 0.15
-    upper_profile_fraction: 0.65
-    minimum_reference_std: 0.01
-    lower_std_ratio: 0.9
-    upper_std_ratio: 1.15
-  shift_dispersion:
-    enabled: true
-    weight: 0.0005
-    minimum_reference_std_cm1: 0.25
-    lower_std_ratio: 0.85
-    upper_std_ratio: 1.2
-  width_dispersion:
-    enabled: true
-    weight: 0.0005
-    minimum_reference_std_cm1: 0.25
-    lower_std_ratio: 0.85
-    upper_std_ratio: 1.2
-  height_cv_upper:
-    enabled: true
-    weight: 0.001
-    minimum_reference_cv: 0.02
-    upper_ratio: 1.05
+    - xlsx
+    - csv

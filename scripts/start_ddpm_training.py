@@ -13,8 +13,9 @@ python -m compileall -q \
 echo "===== 2. 软件包依赖检查 ====="
 python -m pip check
 
-echo "===== 3. 项目自动化测试 ====="
+echo "===== 3. 项目完整自动化测试 ====="
 python -m pytest -v
+
 
 开始训练指令
     CUDA_VISIBLE_DEVICES=1 \
@@ -37,7 +38,6 @@ python -m pytest -v
     git commit -m "D1: add new module"
     git push
 """
-
 from __future__ import annotations
 
 import argparse
@@ -45,7 +45,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import (
+    DataLoader,
+    Subset,
+)
 
 from src.checkpoint_manager import (
     CheckpointManager,
@@ -56,15 +59,27 @@ from src.configuration_loader import (
     load_configuration,
     resolve_project_path,
 )
-from src.dataset_splitter import split_spectrum_collection
-from src.ddpm_trainer import DdpmTrainer
+from src.dataset_splitter import (
+    split_spectrum_collection,
+)
+from src.ddpm_trainer import (
+    DdpmTrainer,
+)
 from src.feature_peak_residual_limiter import (
     fit_feature_peak_residual_limiter_state,
 )
-from src.intensity_normalizer import GlobalMinMaxNormalizer
-from src.model_builder import build_diffusion_model
-from src.one_dimensional_ddpm import get_backend_version
-from src.prior_residual import PriorResidualTransformer
+from src.intensity_normalizer import (
+    GlobalMinMaxNormalizer,
+)
+from src.model_builder import (
+    build_diffusion_model,
+)
+from src.one_dimensional_ddpm import (
+    get_backend_version,
+)
+from src.prior_residual import (
+    PriorResidualTransformer,
+)
 from src.random_seed_manager import (
     create_data_loader_generator,
     seed_data_loader_worker,
@@ -76,41 +91,62 @@ from src.sers_diversity_constraints import (
 from src.sers_physics_constraints import (
     fit_sers_physics_constraint_state,
 )
-from src.spectrum_dataset import SpectrumDataset
+from src.spectrum_dataset import (
+    SpectrumDataset,
+)
 from src.spectrum_file_reader import (
     SpectrumCollection,
     read_spectrum_collection,
 )
-from src.spectrum_length_adapter import SpectrumLengthAdapter
-from src.training_logger import TrainingLogger
+from src.spectrum_length_adapter import (
+    SpectrumLengthAdapter,
+)
+from src.training_logger import (
+    TrainingLogger,
+)
 
 
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="训练一维SERS DDPM。"
     )
+
     parser.add_argument(
         "--config",
         required=True,
         help="YAML配置文件路径。",
     )
+
     parser.add_argument(
         "--resume",
         default=None,
-        help="可选：从同一模型阶段的checkpoint继续训练。",
+        help="从同一实验阶段checkpoint继续训练。",
     )
+
     return parser.parse_args()
 
 
-def resolve_device(device_text: str) -> torch.device:
-    normalized = str(device_text).strip().lower()
+def resolve_device(
+    device_text: str,
+) -> torch.device:
+    normalized = str(
+        device_text
+    ).strip().lower()
 
-    if normalized.startswith("cuda") and not torch.cuda.is_available():
+    if (
+        normalized.startswith(
+            "cuda"
+        )
+        and not torch.cuda.is_available()
+    ):
         raise RuntimeError(
-            "配置要求使用CUDA，但PyTorch未检测到可用GPU。"
+            "配置要求使用CUDA，"
+            "但PyTorch没有检测到可用GPU。"
         )
 
-    return torch.device(normalized)
+    return torch.device(
+        normalized
+    )
 
 
 def validate_split_indices(
@@ -126,18 +162,37 @@ def validate_split_indices(
         "测试集": test_indices,
     }
 
-    for subset_name, indices in named_indices.items():
+    for (
+        subset_name,
+        indices,
+    ) in named_indices.items():
         if indices.size == 0:
-            raise RuntimeError(f"{subset_name}为空。")
+            raise RuntimeError(
+                f"{subset_name}为空。"
+            )
 
         if (
-            np.any(indices < 0)
-            or np.any(indices >= number_of_spectra)
+            np.any(
+                indices < 0
+            )
+            or np.any(
+                indices
+                >= number_of_spectra
+            )
         ):
-            raise RuntimeError(f"{subset_name}包含越界索引。")
+            raise RuntimeError(
+                f"{subset_name}包含越界索引。"
+            )
 
-        if np.unique(indices).size != indices.size:
-            raise RuntimeError(f"{subset_name}包含重复索引。")
+        if (
+            np.unique(
+                indices
+            ).size
+            != indices.size
+        ):
+            raise RuntimeError(
+                f"{subset_name}包含重复索引。"
+            )
 
     all_indices = np.concatenate(
         [
@@ -148,22 +203,39 @@ def validate_split_indices(
     )
 
     if (
-        all_indices.size != number_of_spectra
-        or np.unique(all_indices).size != number_of_spectra
+        all_indices.size
+        != number_of_spectra
+        or np.unique(
+            all_indices
+        ).size
+        != number_of_spectra
     ):
         raise RuntimeError(
-            "训练集、验证集和测试集没有无重复覆盖全部光谱。"
+            "训练、验证和测试没有无重复覆盖全部光谱。"
         )
 
 
-def resolve_training_log_file(configuration: dict) -> Path:
-    output = configuration["output"]
+def resolve_training_log_file(
+    configuration: dict,
+) -> Path:
+    output = configuration[
+        "output"
+    ]
 
-    if "training_log_file" in output:
-        value = output["training_log_file"]
+    if (
+        "training_log_file"
+        in output
+    ):
+        value = output[
+            "training_log_file"
+        ]
     else:
         value = (
-            Path(output["log_directory"])
+            Path(
+                output[
+                    "log_directory"
+                ]
+            )
             / str(
                 output.get(
                     "training_log_name",
@@ -172,32 +244,64 @@ def resolve_training_log_file(configuration: dict) -> Path:
             )
         )
 
-    return resolve_project_path(configuration, value)
+    return resolve_project_path(
+        configuration,
+        value,
+    )
 
 
 def build_single_spectrum_overfit_collection(
     *,
     collection: SpectrumCollection,
     diagnostic_config: dict,
-) -> tuple[SpectrumCollection, dict[str, object] | None]:
-    if not bool(diagnostic_config.get("enabled", False)):
-        return collection, None
+) -> tuple[
+    SpectrumCollection,
+    dict[str, object] | None,
+]:
+    """保留已有单谱重复过拟合诊断接口。"""
+
+    if not bool(
+        diagnostic_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        return (
+            collection,
+            None,
+        )
 
     spectrum_index = int(
-        diagnostic_config.get("spectrum_index", 0)
+        diagnostic_config.get(
+            "spectrum_index",
+            0,
+        )
     )
+
     repeat_count = int(
-        diagnostic_config.get("repeat_count", 50)
+        diagnostic_config.get(
+            "repeat_count",
+            50,
+        )
     )
-    original_count = len(collection.spectrum_names)
+
+    original_count = len(
+        collection.spectrum_names
+    )
 
     if original_count == 0:
-        raise RuntimeError("原始数据中没有可用光谱。")
+        raise RuntimeError(
+            "原始数据中没有可用光谱。"
+        )
 
-    if not 0 <= spectrum_index < original_count:
+    if not (
+        0
+        <= spectrum_index
+        < original_count
+    ):
         raise IndexError(
             "diagnostic_overfit.spectrum_index越界："
-            f"当前有效范围为0到{original_count - 1}。"
+            f"有效范围0到{original_count - 1}。"
         )
 
     if repeat_count < 10:
@@ -206,92 +310,178 @@ def build_single_spectrum_overfit_collection(
         )
 
     selected_spectrum = np.asarray(
-        collection.spectra[spectrum_index],
+        collection.spectra[
+            spectrum_index
+        ],
         dtype=np.float32,
     ).reshape(-1)
+
     selected_axis = np.asarray(
-        collection.raman_shifts[spectrum_index],
+        collection.raman_shifts[
+            spectrum_index
+        ],
         dtype=np.float64,
     ).reshape(-1)
 
-    if selected_spectrum.size != selected_axis.size:
-        raise RuntimeError("所选光谱和拉曼轴长度不一致。")
+    if (
+        selected_spectrum.size
+        != selected_axis.size
+    ):
+        raise RuntimeError(
+            "所选光谱和拉曼轴长度不一致。"
+        )
 
     if selected_axis.size < 2:
-        raise RuntimeError("所选拉曼轴至少需要2个点。")
+        raise RuntimeError(
+            "所选拉曼轴至少需要2个点。"
+        )
 
     if (
-        not np.isfinite(selected_spectrum).all()
-        or not np.isfinite(selected_axis).all()
+        not np.isfinite(
+            selected_spectrum
+        ).all()
+        or not np.isfinite(
+            selected_axis
+        ).all()
     ):
-        raise RuntimeError("所选光谱或拉曼轴包含NaN/无穷值。")
+        raise RuntimeError(
+            "所选光谱或拉曼轴包含NaN/无穷值。"
+        )
 
-    if not np.all(np.diff(selected_axis) > 0.0):
-        raise RuntimeError("所选拉曼轴必须严格递增。")
+    if not np.all(
+        np.diff(
+            selected_axis
+        )
+        > 0.0
+    ):
+        raise RuntimeError(
+            "所选拉曼轴必须严格递增。"
+        )
 
     selected_name = str(
-        collection.spectrum_names[spectrum_index]
+        collection.spectrum_names[
+            spectrum_index
+        ]
     )
-    selected_source_file = collection.source_files[spectrum_index]
-    selected_relative_source_file = (
-        collection.relative_source_files[spectrum_index]
-    )
-    selected_label = collection.labels[spectrum_index]
 
-    repeated_collection = SpectrumCollection(
-        raman_shift=selected_axis.copy(),
-        spectra=np.repeat(
-            selected_spectrum[None, :],
-            repeat_count,
-            axis=0,
-        ).astype(np.float32, copy=False),
-        raman_shifts=np.repeat(
-            selected_axis[None, :],
-            repeat_count,
-            axis=0,
-        ).astype(np.float64, copy=False),
-        original_lengths=np.full(
-            repeat_count,
-            selected_axis.size,
-            dtype=np.int64,
-        ),
-        source_files=np.asarray(
-            [selected_source_file] * repeat_count,
-            dtype=object,
-        ),
-        relative_source_files=np.asarray(
-            [selected_relative_source_file] * repeat_count,
-            dtype=object,
-        ),
-        spectrum_names=np.asarray(
-            [
-                f"{selected_name}__repeat_{index + 1:04d}"
-                for index in range(repeat_count)
-            ],
-            dtype=object,
-        ),
-        labels=np.asarray(
-            [selected_label] * repeat_count,
-            dtype=object,
-        ),
+    selected_source_file = (
+        collection.source_files[
+            spectrum_index
+        ]
+    )
+
+    selected_relative_source_file = (
+        collection.relative_source_files[
+            spectrum_index
+        ]
+    )
+
+    selected_label = (
+        collection.labels[
+            spectrum_index
+        ]
+    )
+
+    repeated_collection = (
+        SpectrumCollection(
+            raman_shift=selected_axis.copy(),
+            spectra=np.repeat(
+                selected_spectrum[
+                    None,
+                    :
+                ],
+                repeat_count,
+                axis=0,
+            ).astype(
+                np.float32,
+                copy=False,
+            ),
+            raman_shifts=np.repeat(
+                selected_axis[
+                    None,
+                    :
+                ],
+                repeat_count,
+                axis=0,
+            ).astype(
+                np.float64,
+                copy=False,
+            ),
+            original_lengths=np.full(
+                repeat_count,
+                selected_axis.size,
+                dtype=np.int64,
+            ),
+            source_files=np.asarray(
+                [
+                    selected_source_file
+                ]
+                * repeat_count,
+                dtype=object,
+            ),
+            relative_source_files=np.asarray(
+                [
+                    selected_relative_source_file
+                ]
+                * repeat_count,
+                dtype=object,
+            ),
+            spectrum_names=np.asarray(
+                [
+                    (
+                        f"{selected_name}"
+                        f"__repeat_{index + 1:04d}"
+                    )
+                    for index
+                    in range(
+                        repeat_count
+                    )
+                ],
+                dtype=object,
+            ),
+            labels=np.asarray(
+                [
+                    selected_label
+                ]
+                * repeat_count,
+                dtype=object,
+            ),
+        )
     )
 
     metadata: dict[str, object] = {
         "enabled": True,
         "formal_validation": False,
-        "original_number_of_spectra": int(original_count),
-        "selected_original_index": int(spectrum_index),
-        "selected_spectrum_name": selected_name,
-        "selected_source_file": str(selected_source_file),
+        "original_number_of_spectra": int(
+            original_count
+        ),
+        "selected_original_index": int(
+            spectrum_index
+        ),
+        "selected_spectrum_name": (
+            selected_name
+        ),
+        "selected_source_file": str(
+            selected_source_file
+        ),
         "selected_relative_source_file": str(
             selected_relative_source_file
         ),
-        "selected_label": str(selected_label),
-        "selected_original_length": int(selected_axis.size),
-        "repeat_count": int(repeat_count),
+        "selected_label": str(
+            selected_label
+        ),
+        "selected_original_length": int(
+            selected_axis.size
+        ),
+        "repeat_count": int(
+            repeat_count
+        ),
     }
 
-    return repeated_collection, metadata
+    return (
+        repeated_collection,
+        metadata,
+    )
 
 
 def resolve_resume_path(
@@ -299,7 +489,9 @@ def resolve_resume_path(
     configuration: dict,
     resume_argument: str,
 ) -> Path:
-    resume_path = Path(resume_argument).expanduser()
+    resume_path = Path(
+        resume_argument
+    ).expanduser()
 
     if not resume_path.is_absolute():
         resume_path = resolve_project_path(
@@ -320,41 +512,150 @@ def validate_resume_stage(
     checkpoint_path: Path,
     configuration: dict,
 ) -> None:
+    """
+    禁止跨 prior 数据域、D3 模块或 loss 配置直接 resume。
+
+    特别注意：
+    D2.4 blended prior 不能从 D2.3 low-frequency checkpoint
+    或 D2.1 median checkpoint 直接 --resume。
+    """
+
     checkpoint = load_checkpoint_file(
         checkpoint_path,
         map_location="cpu",
     )
-    checkpoint_configuration = checkpoint.get("configuration")
 
-    if not isinstance(checkpoint_configuration, dict):
-        raise RuntimeError("resume检查点缺少有效configuration。")
+    checkpoint_configuration = (
+        checkpoint.get(
+            "configuration"
+        )
+    )
 
-    for key, description in (
-        ("physics_constraints", "D3物理病态保护"),
-        ("diversity_constraints", "D3.4低噪声多样性约束"),
-        ("feature_peak_residual_limiter", "D3.5特征峰残差软上限"),
+    if not isinstance(
+        checkpoint_configuration,
+        dict,
     ):
-        current_value = configuration.get(key, {}) or {}
-        checkpoint_value = checkpoint_configuration.get(key, {}) or {}
+        raise RuntimeError(
+            "resume检查点缺少有效configuration。"
+        )
 
-        if current_value != checkpoint_value:
-            raise ValueError(
-                f"当前{description}配置与resume检查点不一致。"
-                "D3.4不能从D2.1/D3.2/D3.3 checkpoint直接--resume；"
-                "断点续训只能使用同一D3.4实验的checkpoint。"
+    configuration_pairs = (
+        (
+            "prior_residual",
+            "D2先验残差",
+        ),
+        (
+            "physics_constraints",
+            "D3物理约束",
+        ),
+        (
+            "diversity_constraints",
+            "D3多样性约束",
+        ),
+        (
+            "feature_peak_residual_limiter",
+            "D3特征峰残差limiter",
+        ),
+        (
+            "local_peak_distribution_constraints",
+            "D3局部峰分布约束",
+        ),
+    )
+
+    for (
+        key,
+        description,
+    ) in configuration_pairs:
+        current_value = (
+            configuration.get(
+                key,
+                {},
             )
+            or {}
+        )
+
+        checkpoint_value = (
+            checkpoint_configuration.get(
+                key,
+                {},
+            )
+            or {}
+        )
+
+        if (
+            current_value
+            != checkpoint_value
+        ):
+            raise ValueError(
+                f"当前{description}配置"
+                "与resume检查点不一致。"
+                "只能从同一模型阶段、"
+                "同一数据域的checkpoint续训。"
+            )
+
+    current_residual_aware = (
+        configuration.get(
+            "diffusion",
+            {},
+        ).get(
+            "residual_aware_loss",
+            {
+                "enabled": False,
+            },
+        )
+        or {
+            "enabled": False,
+        }
+    )
+
+    checkpoint_residual_aware = (
+        checkpoint_configuration.get(
+            "diffusion",
+            {},
+        ).get(
+            "residual_aware_loss",
+            {
+                "enabled": False,
+            },
+        )
+        or {
+            "enabled": False,
+        }
+    )
+
+    if (
+        current_residual_aware
+        != checkpoint_residual_aware
+    ):
+        raise ValueError(
+            "当前diffusion.residual_aware_loss"
+            "与resume检查点不一致。"
+        )
 
 
 def print_prior_residual_summary(
     transformer: PriorResidualTransformer,
     transformed_training_residuals: np.ndarray,
 ) -> None:
-    print("\n===== D2先验残差状态 =====")
-    print(f"先验方法：{transformer.prior_method}")
-    print(f"残差归一化方法：{transformer.normalization_method}")
+    """打印 D2 状态。"""
+
+    print(
+        "\n===== D2先验残差状态 ====="
+    )
+
+    print(
+        "先验方法："
+        f"{transformer.prior_method}"
+    )
+
+    print(
+        "残差归一化方法："
+        f"{transformer.normalization_method}"
+    )
 
     statistics = (
-        transformer.training_abs_residual_percentiles or {}
+        transformer.training_abs_residual_percentiles
+        or {}
     )
 
     for key in (
@@ -367,20 +668,42 @@ def print_prior_residual_summary(
         "max",
     ):
         if key in statistics:
-            print(f"训练原始残差 {key}: {statistics[key]:.8g}")
+            print(
+                f"训练原始残差 {key}: "
+                f"{statistics[key]:.8g}"
+            )
 
-    if transformer.normalization_method == "pointwise_mad_asinh":
+    if (
+        transformer.normalization_method
+        == "robust_asinh"
+    ):
+        print(
+            "残差缩放系数："
+            f"{transformer.residual_scale:.8g}"
+        )
+
+        print(
+            "asinh归一化因子："
+            f"{transformer.asinh_normalizer:.8g}"
+        )
+
+    elif (
+        transformer.normalization_method
+        == "pointwise_mad_asinh"
+    ):
         print(
             "逐波数MAD换算系数："
             f"{transformer.mad_scale_factor:.8g}"
         )
+
         print(
             "逐波数尺度下限："
             f"{transformer.pointwise_scale_floor:.8g}"
         )
 
         pointwise_statistics = (
-            transformer.training_pointwise_scale_percentiles or {}
+            transformer.training_pointwise_scale_percentiles
+            or {}
         )
 
         for key in (
@@ -402,256 +725,308 @@ def print_prior_residual_summary(
             "标准化残差尺度："
             f"{transformer.residual_scale:.8g}"
         )
+
         print(
             "asinh归一化因子："
             f"{transformer.asinh_normalizer:.8g}"
         )
 
-    if transformer.prior_method == "pca_reconstruction":
+    if (
+        transformer.prior_method
+        == "pca_reconstruction"
+    ):
         cumulative_ratio = float(
-            np.sum(transformer.pca_explained_variance_ratio_)
+            np.sum(
+                transformer.pca_explained_variance_ratio_
+            )
         )
-        print("D2.2 PCA可变先验：已启用")
+
+        print(
+            "D2.2 PCA可变先验：已启用"
+        )
+
         print(
             "PCA主成分数："
             f"{transformer.pca_components.shape[0]}"
         )
+
         print(
             "累计解释方差比例："
             f"{cumulative_ratio:.6f}"
         )
+
         print(
-            "生成端分数截断范围：训练均值±"
-            f"{transformer.pca_score_clip_standard_deviations:g}×标准差"
+            "PCA score采样策略："
+            f"{transformer.pca_sampling_strategy}"
         )
 
-    absolute_values = np.abs(transformed_training_residuals)
-    percentiles = np.percentile(
-        absolute_values,
-        [50.0, 90.0, 95.0, 99.0, 99.5, 99.9, 100.0],
+        print(
+            "PCA score截断范围：±"
+            f"{transformer.pca_score_clip_standard_deviations:g}"
+            "个标准差"
+        )
+
+    if transformer.prior_method in {
+        "training_low_frequency_median",
+        "training_blended_frequency_median",
+    }:
+        print(
+            "低频先验方法："
+            f"{transformer.low_frequency_method}"
+        )
+
+        print(
+            "Gaussian sigma："
+            f"{transformer.low_frequency_sigma_cm1:g} cm^-1"
+        )
+
+        print(
+            "Gaussian truncate："
+            f"{transformer.low_frequency_truncate:g}"
+        )
+
+        print(
+            "辅助等间距轴间隔："
+            f"{transformer.low_frequency_uniform_spacing_cm1:.8g} "
+            "cm^-1"
+        )
+
+        print(
+            "换算sigma_points："
+            f"{transformer.low_frequency_sigma_points:.8g}"
+        )
+
+        print(
+            "低频prior拟合训练谱数量："
+            f"{transformer.low_frequency_number_of_training_spectra}"
+        )
+
+    if (
+        transformer.prior_method
+        == "training_blended_frequency_median"
+    ):
+        print(
+            "D2.4频率混合先验：已启用"
+        )
+
+        print(
+            "共同峰骨架保留比例 alpha："
+            f"{transformer.blended_peak_component_ratio:g}"
+        )
+
+        print(
+            "D2.4公式："
+            "P_blend = P_low + alpha * "
+            "(P_median - P_low)"
+        )
+
+    absolute_values = np.abs(
+        np.asarray(
+            transformed_training_residuals,
+            dtype=np.float64,
+        )
     )
 
-    for name, value in zip(
-        ("p50", "p90", "p95", "p99", "p99.5", "p99.9", "max"),
-        percentiles,
-        strict=True,
-    ):
-        print(f"变换后残差 {name}: {float(value):.8g}")
+    percentiles = np.percentile(
+        absolute_values,
+        [
+            50.0,
+            90.0,
+            95.0,
+            99.0,
+            99.5,
+            99.9,
+            100.0,
+        ],
+    )
 
-    print("==============================\n")
+    for (
+        name,
+        value,
+    ) in zip(
+        (
+            "p50",
+            "p90",
+            "p95",
+            "p99",
+            "p99.5",
+            "p99.9",
+            "max",
+        ),
+        percentiles,
+    ):
+        print(
+            f"变换后残差 {name}: "
+            f"{float(value):.8g}"
+        )
+
+    for threshold in (
+        0.50,
+        0.80,
+        0.95,
+        1.00,
+    ):
+        fraction = float(
+            np.mean(
+                absolute_values
+                > threshold
+            )
+            * 100.0
+        )
+
+        print(
+            f"|scaled residual| > "
+            f"{threshold:.2f} 比例："
+            f"{fraction:.4f}%"
+        )
+
+    print(
+        "==============================\n"
+    )
 
 
 def print_physics_summary(
-    physics_constraint_state: dict[str, object] | None,
+    state: dict | None,
 ) -> None:
-    if not physics_constraint_state or not bool(
-        physics_constraint_state.get("enabled", False)
+    if (
+        not state
+        or not bool(
+            state.get(
+                "enabled",
+                False,
+            )
+        )
     ):
-        print("D3.1物理约束：未启用")
+        print(
+            "D3物理/峰约束：未启用"
+        )
+
         return
 
-    configuration = physics_constraint_state["configuration"]
-    detection = configuration["peak_detection"]
-
-    print("\n===== D3.1目标自适应SERS物理约束 =====")
-    print("固定特征峰位置：无")
-    print("固定peak_windows：无")
-    print("峰选择方式：每条真实目标光谱独立动态检测")
     print(
-        "训练光谱数量："
-        f"{physics_constraint_state['number_of_training_spectra']}"
+        "D3物理/峰约束：已启用"
     )
-    print(
-        "峰位零惩罚范围：±"
-        f"{configuration['peak_position']['zero_penalty_tolerance_cm1']:g} "
-        "cm^-1"
-    )
-    print(
-        "每条光谱最多约束峰数："
-        f"{detection['maximum_peaks_per_spectrum']}"
-    )
-    print(
-        "自适应局部分析半宽：±"
-        f"{detection['analysis_half_width_cm1']:g} cm^-1"
-    )
-    print(
-        "训练集峰显著性下限："
-        f"{physics_constraint_state['training_prominence_floor']:.8g}"
-    )
-    print(
-        "一阶导数软上限："
-        f"{physics_constraint_state['first_derivative_abs_limit']:.8g}"
-    )
-    print(
-        "二阶导数软上限："
-        f"{physics_constraint_state['second_derivative_abs_limit']:.8g}"
-    )
-    print(
-        "完整归一化强度软范围："
-        f"{physics_constraint_state['allowed_intensity_minimum']:.8g}–"
-        f"{physics_constraint_state['allowed_intensity_maximum']:.8g}"
-    )
-    print(
-        "D2.1缩放残差绝对值软上限："
-        f"{physics_constraint_state['scaled_residual_abs_limit']:.8g}"
-    )
-    print(f"物理总权重：{configuration['total_weight']:g}")
-    print("========================================\n")
 
 
 def print_diversity_summary(
-    diversity_constraint_state: dict[str, object] | None,
+    state: dict | None,
 ) -> None:
-    if not diversity_constraint_state or not bool(
-        diversity_constraint_state.get("enabled", False)
+    if (
+        not state
+        or not bool(
+            state.get(
+                "enabled",
+                False,
+            )
+        )
     ):
-        print("D3.4低噪声残差多样性约束：未启用")
+        print(
+            "D3多样性约束：未启用"
+        )
+
         return
 
-    diversity = diversity_constraint_state["configuration"]
-    gate = diversity["low_noise_gate"]
-    distance = diversity["pairwise_distance"]
-    correlation = diversity["pairwise_correlation"]
-    variance = diversity["pointwise_variance_floor"]
-
-    print("\n===== D3.4低噪声残差多样性约束 =====")
-    print("人工固定农药峰位：无")
-    number_of_training_spectra = int(
-        diversity_constraint_state.get("number_of_training_spectra", 0)
-    )
-    print(f"训练集拟合残差数量：{number_of_training_spectra}")
-    active_positions = int(
-        np.asarray(diversity_constraint_state["active_mask"]).sum()
-    )
     print(
-        "有效波数点："
-        f"{active_positions}/"
-        f"{diversity_constraint_state['original_length']}"
+        "D3多样性约束：已启用"
     )
-    print(
-        "低噪声门控：alpha_bar >= "
-        f"{float(gate['minimum_alpha_cumprod']):.3f}，"
-        "有效样本数 >= "
-        f"{int(gate['minimum_samples'])}"
-    )
-    print(
-        "成对距离范围：目标距离的 "
-        f"{float(distance['minimum_distance_ratio']):.2f}–"
-        f"{float(distance['maximum_distance_ratio']):.2f} 倍"
-    )
-    print(
-        "相关性最大额外容许值："
-        f"{float(correlation['maximum_excess_correlation']):.4f}"
-    )
-    print(
-        "逐点标准差下限：训练集标准差的 "
-        f"{float(variance['minimum_std_ratio']):.2f} 倍"
-    )
-    print(f"多样性总权重：{float(diversity['total_weight']):g}")
-    print("固定中位数prior：本阶段保持不变，用于单变量消融")
-    print("====================================\n")
 
 
 def print_feature_peak_residual_limiter_summary(
-    limiter_state: dict[str, object] | None,
+    state: dict | None,
 ) -> None:
-    """打印仅由训练集拟合的 D3.5 采样端残差上限。"""
+    if (
+        not state
+        or not bool(
+            state.get(
+                "enabled",
+                False,
+            )
+        )
+    ):
+        print(
+            "D3特征峰残差limiter：未启用"
+        )
 
-    if not limiter_state or not bool(limiter_state.get("enabled", False)):
-        print("D3.5特征峰残差软上限：未启用")
         return
 
-    limiter = limiter_state["configuration"]
-    selected_shifts = np.asarray(
-        limiter_state["selected_peak_raman_shifts"],
-        dtype=np.float64,
-    )
-    limits = np.asarray(
-        limiter_state["pointwise_soft_limit"],
-        dtype=np.float64,
-    )
-    active_mask = np.asarray(
-        limiter_state["feature_peak_mask"],
-        dtype=np.uint8,
-    ).astype(bool)
-    active_limits = limits[active_mask]
-
-    print("\n===== D3.5特征峰残差软上限 =====")
-    print("作用位置：采样结束、加回先验后、轴插值和反归一化前")
     print(
-        "训练集拟合光谱数："
-        f"{int(limiter_state['number_of_training_spectra'])}"
+        "D3特征峰残差limiter：已启用"
     )
-    print(f"自动识别先验特征峰数：{selected_shifts.size}")
-    print(
-        "先验特征峰位移："
-        + "、".join(f"{value:.2f}" for value in selected_shifts)
-        + " cm^-1"
-    )
-    print(
-        "峰区残差参考分位数："
-        f"{float(limiter_state['absolute_residual_quantile']):.2f}%"
-    )
-    print(
-        "残差上限倍数："
-        f"{float(limiter['limit_multiplier']):.3f}"
-    )
-    print(
-        "峰区软上限范围（归一化强度域）："
-        f"{float(active_limits.min()):.8g}–"
-        f"{float(active_limits.max()):.8g}"
-    )
-    print(
-        "峰区软过渡比例："
-        f"{float(limiter['soft_transition_fraction']):.3f}"
-    )
-    print("非特征峰区域：不修改")
-    print("================================\n")
 
 
 def main() -> None:
     arguments = parse_arguments()
-    configuration = load_configuration(arguments.config)
 
-    project_config = configuration["project"]
-    random_config = configuration.get("random", {})
-    data_config = configuration["data"]
-    model_config = configuration["model"]
-    normalization_config = configuration["normalization"]
-    training_config = configuration["training"]
-    output_config = configuration["output"]
+    configuration = load_configuration(
+        arguments.config
+    )
+
+    project_config = configuration[
+        "project"
+    ]
+
     diagnostic_config = configuration.get(
         "diagnostic_overfit",
         {},
     )
+
+    data_config = configuration[
+        "data"
+    ]
+
+    model_config = configuration[
+        "model"
+    ]
+
+    normalization_config = configuration[
+        "normalization"
+    ]
+
+    prior_config = configuration.get(
+        "prior_residual",
+        {},
+    ) or {}
+
     physics_config = configuration.get(
         "physics_constraints",
-        {"enabled": False},
+        {
+            "enabled": False,
+        },
     )
 
-    if not isinstance(diagnostic_config, dict):
-        raise TypeError("diagnostic_overfit必须是字典。")
+    training_config = configuration[
+        "training"
+    ]
+
+    output_config = configuration[
+        "output"
+    ]
 
     random_seed = int(
-        random_config.get(
-            "seed",
-            project_config.get("random_seed", 42),
+        project_config.get(
+            "random_seed",
+            2026,
         )
     )
+
     set_random_seed(
         random_seed=random_seed,
-        deterministic=bool(
-            random_config.get("deterministic", False)
-        ),
     )
 
-    input_directory = resolve_project_path(
-        configuration,
-        data_config["input_directory"],
+    input_directory = (
+        resolve_project_path(
+            configuration,
+            data_config[
+                "input_directory"
+            ],
+        )
     )
-    collection = read_spectrum_collection(
-        input_directory=input_directory,
-        data_config=data_config,
+
+    collection = (
+        read_spectrum_collection(
+            input_directory=input_directory,
+            data_config=data_config,
+        )
     )
 
     collection, overfit_metadata = (
@@ -661,35 +1036,37 @@ def main() -> None:
         )
     )
 
-    if overfit_metadata is not None:
-        if arguments.resume is not None:
-            raise ValueError(
-                "单光谱过拟合诊断必须从头训练，不能使用--resume。"
-            )
-
-        data_config = dict(data_config)
-        data_config["split_unit"] = "spectrum"
-        data_config["shuffle"] = False
-        configuration["data"] = data_config
-
-    number_of_spectra = len(collection.spectrum_names)
+    number_of_spectra = len(
+        collection.spectrum_names
+    )
 
     if number_of_spectra == 0:
-        raise RuntimeError("没有读取到任何光谱。")
+        raise RuntimeError(
+            "没有读取到任何光谱。"
+        )
 
-    dataset_split = split_spectrum_collection(
-        collection=collection,
-        data_config=data_config,
-        random_seed=random_seed,
+    # ------------------------------------------------------------------
+    # 数据划分
+    # ------------------------------------------------------------------
+
+    dataset_split = (
+        split_spectrum_collection(
+            collection=collection,
+            data_config=data_config,
+            random_seed=random_seed,
+        )
     )
+
     training_indices = np.asarray(
         dataset_split.train.indices,
         dtype=np.int64,
     ).reshape(-1)
+
     validation_indices = np.asarray(
         dataset_split.validation.indices,
         dtype=np.int64,
     ).reshape(-1)
+
     test_indices = np.asarray(
         dataset_split.test.indices,
         dtype=np.int64,
@@ -702,27 +1079,43 @@ def main() -> None:
         number_of_spectra=number_of_spectra,
     )
 
-    length_adapter = SpectrumLengthAdapter.create(
-        raman_shifts=collection.raman_shifts,
-        dimension_multipliers=model_config[
-            "dimension_multipliers"
-        ],
-        model_length=data_config.get(
-            "model_spectrum_length",
-            "auto",
-        ),
-        padding_mode=str(
-            data_config.get(
-                "padding_mode",
-                "right_zero_padding",
-            )
-        ),
-        padding_value=float(
-            data_config.get("padding_value", 0.0)
-        ),
-        raman_range_tolerance=float(
-            data_config.get("raman_range_tolerance", 1.0)
-        ),
+    # ------------------------------------------------------------------
+    # 拉曼轴统一
+    # ------------------------------------------------------------------
+
+    length_adapter = (
+        SpectrumLengthAdapter.create(
+            raman_shifts=(
+                collection.raman_shifts
+            ),
+            dimension_multipliers=(
+                model_config[
+                    "dimension_multipliers"
+                ]
+            ),
+            model_length=data_config.get(
+                "model_spectrum_length",
+                "auto",
+            ),
+            padding_mode=str(
+                data_config.get(
+                    "padding_mode",
+                    "right_zero_padding",
+                )
+            ),
+            padding_value=float(
+                data_config.get(
+                    "padding_value",
+                    0.0,
+                )
+            ),
+            raman_range_tolerance=float(
+                data_config.get(
+                    "raman_range_tolerance",
+                    1.0,
+                )
+            ),
+        )
     )
 
     spectra_on_model_axis = (
@@ -731,6 +1124,7 @@ def main() -> None:
             collection.raman_shifts,
         )
     )
+
     spectra_on_model_axis = np.asarray(
         spectra_on_model_axis,
         dtype=np.float32,
@@ -741,40 +1135,79 @@ def main() -> None:
         length_adapter.original_length,
     )
 
-    if spectra_on_model_axis.shape != expected_shape:
+    if (
+        spectra_on_model_axis.shape
+        != expected_shape
+    ):
         raise RuntimeError(
             "插值后的光谱形状不正确："
-            f"实际为{spectra_on_model_axis.shape}，"
-            f"期望为{expected_shape}。"
+            f"实际={spectra_on_model_axis.shape}，"
+            f"期望={expected_shape}。"
         )
 
-    if not np.isfinite(spectra_on_model_axis).all():
-        raise RuntimeError("插值后的光谱包含NaN或无穷值。")
+    if not np.isfinite(
+        spectra_on_model_axis
+    ).all():
+        raise RuntimeError(
+            "插值后的光谱包含NaN或无穷值。"
+        )
 
-    normalizer: GlobalMinMaxNormalizer | None = None
+    # ------------------------------------------------------------------
+    # train-only global_minmax
+    # ------------------------------------------------------------------
+
+    normalizer: (
+        GlobalMinMaxNormalizer | None
+    ) = None
+
     normalization_state = None
 
-    if bool(normalization_config.get("enabled", False)):
-        normalizer = GlobalMinMaxNormalizer(
-            target_min=float(
-                normalization_config.get("target_min", -1.0)
-            ),
-            target_max=float(
-                normalization_config.get("target_max", 1.0)
-            ),
-            epsilon=float(
-                normalization_config.get("epsilon", 1.0e-12)
-            ),
-            clip=bool(
-                normalization_config.get("clip", False)
-            ),
+    if bool(
+        normalization_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        normalizer = (
+            GlobalMinMaxNormalizer(
+                target_min=float(
+                    normalization_config.get(
+                        "target_min",
+                        -1.0,
+                    )
+                ),
+                target_max=float(
+                    normalization_config.get(
+                        "target_max",
+                        1.0,
+                    )
+                ),
+                epsilon=float(
+                    normalization_config.get(
+                        "epsilon",
+                        1.0e-12,
+                    )
+                ),
+                clip=bool(
+                    normalization_config.get(
+                        "clip",
+                        False,
+                    )
+                ),
+            )
         )
 
+        # 严格只在 train 上 fit。
         normalizer.fit(
-            spectra_on_model_axis[training_indices]
+            spectra_on_model_axis[
+                training_indices
+            ]
         )
-        normalized_full_spectra = normalizer.transform(
-            spectra_on_model_axis
+
+        normalized_full_spectra = (
+            normalizer.transform(
+                spectra_on_model_axis
+            )
         )
 
         if bool(
@@ -783,82 +1216,187 @@ def main() -> None:
                 True,
             )
         ):
-            normalization_state = normalizer.state_dict()
-    else:
-        normalized_full_spectra = spectra_on_model_axis.copy()
-
-    prior_config = configuration.get("prior_residual", {}) or {}
-    prior_residual_transformer: PriorResidualTransformer | None = None
-    prior_residual_state = None
-    spectra_for_model = normalized_full_spectra.copy()
-    training_scaled_residuals = spectra_for_model[training_indices]
-
-    if bool(prior_config.get("enabled", False)):
-        if normalizer is None or normalization_state is None:
-            raise ValueError(
-                "启用prior_residual时必须启用并保存训练集归一化状态。"
+            normalization_state = (
+                normalizer.state_dict()
             )
 
-        prior_residual_transformer = PriorResidualTransformer(
-            prior_method=str(
-                prior_config.get(
-                    "prior_method",
-                    "training_pointwise_median",
-                )
-            ),
-            normalization_method=str(
-                prior_config.get(
-                    "residual_normalization",
-                    "robust_asinh",
-                )
-            ),
-            target_abs_max=float(
-                prior_config.get("target_abs_max", 1.0)
-            ),
-            residual_quantile=float(
-                prior_config.get("residual_quantile", 99.5)
-            ),
-            pointwise_scale_floor_quantile=float(
-                prior_config.get(
-                    "pointwise_scale_floor_quantile",
-                    10.0,
-                )
-            ),
-            mad_scale_factor=float(
-                prior_config.get("mad_scale_factor", 1.4826)
-            ),
-            epsilon=float(
-                prior_config.get("epsilon", 1.0e-8)
-            ),
-            pca_explained_variance_ratio=float(
-                prior_config.get("pca_explained_variance_ratio", 0.95)
-            ),
-            pca_max_components=prior_config.get("pca_max_components"),
-            pca_sampling_strategy=str(
-                prior_config.get(
-                    "pca_sampling_strategy",
-                    "truncated_gaussian_scores",
-                )
-            ),
-            pca_score_clip_standard_deviations=float(
-                prior_config.get(
-                    "pca_score_clip_standard_deviations",
-                    2.5,
-                )
+    else:
+        normalized_full_spectra = (
+            spectra_on_model_axis.copy()
+        )
+
+    # ------------------------------------------------------------------
+    # D2 prior-residual
+    # ------------------------------------------------------------------
+
+    prior_residual_transformer: (
+        PriorResidualTransformer | None
+    ) = None
+
+    prior_residual_state = None
+
+    spectra_for_model = (
+        normalized_full_spectra.copy()
+    )
+
+    training_scaled_residuals = (
+        spectra_for_model[
+            training_indices
+        ]
+    )
+
+    if bool(
+        prior_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        if (
+            normalizer is None
+            or normalization_state is None
+        ):
+            raise ValueError(
+                "启用prior_residual时必须启用"
+                "并保存train-only global_minmax状态。"
+            )
+
+        low_frequency_config = (
+            prior_config.get(
+                "low_frequency",
+                {},
+            )
+            or {}
+        )
+
+        blended_frequency_config = (
+            prior_config.get(
+                "blended_frequency",
+                {},
+            )
+            or {}
+        )
+
+        prior_residual_transformer = (
+            PriorResidualTransformer(
+                prior_method=str(
+                    prior_config.get(
+                        "prior_method",
+                        "training_pointwise_median",
+                    )
+                ),
+                normalization_method=str(
+                    prior_config.get(
+                        "residual_normalization",
+                        "robust_asinh",
+                    )
+                ),
+                target_abs_max=float(
+                    prior_config.get(
+                        "target_abs_max",
+                        1.0,
+                    )
+                ),
+                residual_quantile=float(
+                    prior_config.get(
+                        "residual_quantile",
+                        99.5,
+                    )
+                ),
+                pointwise_scale_floor_quantile=float(
+                    prior_config.get(
+                        "pointwise_scale_floor_quantile",
+                        10.0,
+                    )
+                ),
+                mad_scale_factor=float(
+                    prior_config.get(
+                        "mad_scale_factor",
+                        1.4826,
+                    )
+                ),
+                epsilon=float(
+                    prior_config.get(
+                        "epsilon",
+                        1.0e-8,
+                    )
+                ),
+                pca_explained_variance_ratio=float(
+                    prior_config.get(
+                        "pca_explained_variance_ratio",
+                        0.95,
+                    )
+                ),
+                pca_max_components=(
+                    prior_config.get(
+                        "pca_max_components"
+                    )
+                ),
+                pca_sampling_strategy=str(
+                    prior_config.get(
+                        "pca_sampling_strategy",
+                        "truncated_gaussian_scores",
+                    )
+                ),
+                pca_score_clip_standard_deviations=float(
+                    prior_config.get(
+                        "pca_score_clip_standard_deviations",
+                        2.5,
+                    )
+                ),
+                low_frequency_method=str(
+                    low_frequency_config.get(
+                        "method",
+                        "gaussian",
+                    )
+                ),
+                low_frequency_sigma_cm1=float(
+                    low_frequency_config.get(
+                        "sigma_cm1",
+                        40.0,
+                    )
+                ),
+                low_frequency_truncate=float(
+                    low_frequency_config.get(
+                        "truncate",
+                        4.0,
+                    )
+                ),
+                blended_peak_component_ratio=float(
+                    blended_frequency_config.get(
+                        "peak_component_ratio",
+                        0.5,
+                    )
+                ),
+            )
+        )
+
+        # 这里始终把真实 Raman shift 传进去。
+        # median / PCA 会忽略它；
+        # low-frequency / blended-frequency 会使用它。
+        prior_residual_transformer.fit(
+            normalized_full_spectra[
+                training_indices
+            ],
+            raman_shift=np.asarray(
+                length_adapter.model_raman_shift,
+                dtype=np.float64,
             ),
         )
 
-        prior_residual_transformer.fit(
-            normalized_full_spectra[training_indices]
-        )
         training_scaled_residuals = (
             prior_residual_transformer.transform(
-                normalized_full_spectra[training_indices]
+                normalized_full_spectra[
+                    training_indices
+                ]
             )
         )
-        spectra_for_model = prior_residual_transformer.transform(
-            normalized_full_spectra
+
+        spectra_for_model = (
+            prior_residual_transformer.transform(
+                normalized_full_spectra
+            )
         )
+
         prior_residual_state = (
             prior_residual_transformer.state_dict()
         )
@@ -868,18 +1406,33 @@ def main() -> None:
             training_scaled_residuals,
         )
 
+    # ------------------------------------------------------------------
+    # D3 physics
+    # ------------------------------------------------------------------
+
     physics_constraint_state = None
 
-    if bool(physics_config.get("enabled", False)):
+    if bool(
+        physics_config.get(
+            "enabled",
+            False,
+        )
+    ):
         if prior_residual_state is None:
-            raise ValueError("D3.1物理约束要求先完成D2.1拟合。")
+            raise ValueError(
+                "D3物理约束要求先完成D2拟合。"
+            )
 
         physics_constraint_state = (
             fit_sers_physics_constraint_state(
                 training_normalized_spectra=(
-                    normalized_full_spectra[training_indices]
+                    normalized_full_spectra[
+                        training_indices
+                    ]
                 ),
-                training_scaled_residuals=training_scaled_residuals,
+                training_scaled_residuals=(
+                    training_scaled_residuals
+                ),
                 raman_shift=np.asarray(
                     length_adapter.model_raman_shift,
                     dtype=np.float64,
@@ -887,39 +1440,83 @@ def main() -> None:
                 configuration=physics_config,
             )
         )
-        print_physics_summary(physics_constraint_state)
+
+    print_physics_summary(
+        physics_constraint_state
+    )
+
+    # ------------------------------------------------------------------
+    # D3 diversity
+    # ------------------------------------------------------------------
 
     diversity_constraint_state = None
-    diversity_config = configuration.get(
-        "diversity_constraints",
-        {"enabled": False},
+
+    diversity_config = (
+        configuration.get(
+            "diversity_constraints",
+            {
+                "enabled": False,
+            },
+        )
     )
 
-    if bool(diversity_config.get("enabled", False)):
+    if bool(
+        diversity_config.get(
+            "enabled",
+            False,
+        )
+    ):
         diversity_constraint_state = (
             fit_sers_diversity_constraint_state(
-                training_scaled_residuals=training_scaled_residuals,
-                configuration=diversity_config,
+                training_scaled_residuals=(
+                    training_scaled_residuals
+                ),
+                configuration=(
+                    diversity_config
+                ),
             )
         )
-        print_diversity_summary(diversity_constraint_state)
 
-    feature_peak_residual_limiter_state = None
-    limiter_config = configuration.get(
-        "feature_peak_residual_limiter",
-        {"enabled": False},
+    print_diversity_summary(
+        diversity_constraint_state
     )
 
-    if bool(limiter_config.get("enabled", False)):
-        if prior_residual_transformer is None:
+    # ------------------------------------------------------------------
+    # D3 feature limiter
+    # ------------------------------------------------------------------
+
+    feature_peak_residual_limiter_state = (
+        None
+    )
+
+    limiter_config = configuration.get(
+        "feature_peak_residual_limiter",
+        {
+            "enabled": False,
+        },
+    )
+
+    if bool(
+        limiter_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        if (
+            prior_residual_transformer
+            is None
+        ):
             raise ValueError(
-                "D3.5特征峰残差软上限要求先完成D2.1先验残差拟合。"
+                "feature_peak_residual_limiter"
+                "要求先完成prior_residual拟合。"
             )
 
         feature_peak_residual_limiter_state = (
             fit_feature_peak_residual_limiter_state(
                 training_normalized_spectra=(
-                    normalized_full_spectra[training_indices]
+                    normalized_full_spectra[
+                        training_indices
+                    ]
                 ),
                 prior_normalized_intensity=(
                     prior_residual_transformer.prior
@@ -928,65 +1525,126 @@ def main() -> None:
                     length_adapter.model_raman_shift,
                     dtype=np.float64,
                 ),
-                configuration=limiter_config,
+                configuration=(
+                    limiter_config
+                ),
             )
         )
-        print_feature_peak_residual_limiter_summary(
-            feature_peak_residual_limiter_state
+
+    print_feature_peak_residual_limiter_summary(
+        feature_peak_residual_limiter_state
+    )
+
+    # ------------------------------------------------------------------
+    # 网络长度补齐
+    # ------------------------------------------------------------------
+
+    padded_spectra = (
+        length_adapter.adapt(
+            spectra_for_model
+        )
+    )
+
+    if not np.isfinite(
+        padded_spectra
+    ).all():
+        raise RuntimeError(
+            "模型输入包含NaN或无穷值。"
         )
 
-    padded_spectra = length_adapter.adapt(spectra_for_model)
+    # PCA模式约束需要逐样本 reference prior。
+    # fixed prior，包括新的 blended prior，不需要。
+    padded_constraint_reference_priors = (
+        None
+    )
 
-    padded_constraint_reference_priors = None
     if (
-        prior_residual_transformer is not None
-        and prior_residual_transformer.prior_method == "pca_reconstruction"
+        prior_residual_transformer
+        is not None
+        and prior_residual_transformer.prior_method
+        == "pca_reconstruction"
     ):
         constraint_reference_priors = (
-            prior_residual_transformer.reference_priors_for_spectra(
+            prior_residual_transformer
+            .reference_priors_for_spectra(
                 normalized_full_spectra
             )
         )
-        padded_constraint_reference_priors = length_adapter.adapt(
-            constraint_reference_priors
+
+        padded_constraint_reference_priors = (
+            length_adapter.adapt(
+                constraint_reference_priors
+            )
         )
 
-    if not np.isfinite(padded_spectra).all():
-        raise RuntimeError("模型输入包含NaN或无穷值。")
-
-    spectrum_dataset = SpectrumDataset(
-        padded_spectra,
-        constraint_reference_priors=padded_constraint_reference_priors,
+    spectrum_dataset = (
+        SpectrumDataset(
+            padded_spectra,
+            constraint_reference_priors=(
+                padded_constraint_reference_priors
+            ),
+        )
     )
+
     training_dataset = Subset(
         spectrum_dataset,
         training_indices.tolist(),
     )
+
     validation_dataset = Subset(
         spectrum_dataset,
         validation_indices.tolist(),
     )
+
     test_dataset = Subset(
         spectrum_dataset,
         test_indices.tolist(),
     )
 
-    device = resolve_device(str(training_config["device"]))
+    # ------------------------------------------------------------------
+    # DataLoader
+    # ------------------------------------------------------------------
+
+    device = resolve_device(
+        str(
+            training_config[
+                "device"
+            ]
+        )
+    )
+
     number_of_workers = int(
-        training_config.get("number_of_workers", 0)
+        training_config.get(
+            "number_of_workers",
+            0,
+        )
     )
 
     if number_of_workers < 0:
-        raise ValueError("training.number_of_workers不能小于0。")
+        raise ValueError(
+            "training.number_of_workers不能小于0。"
+        )
 
     pin_memory = (
-        bool(training_config.get("pin_memory", False))
+        bool(
+            training_config.get(
+                "pin_memory",
+                False,
+            )
+        )
         and device.type == "cuda"
     )
-    batch_size = int(training_config["batch_size"])
+
+    batch_size = int(
+        training_config[
+            "batch_size"
+        ]
+    )
 
     if batch_size <= 0:
-        raise ValueError("training.batch_size必须大于0。")
+        raise ValueError(
+            "training.batch_size必须大于0。"
+        )
 
     training_loader = DataLoader(
         training_dataset,
@@ -995,12 +1653,24 @@ def main() -> None:
         num_workers=number_of_workers,
         pin_memory=pin_memory,
         drop_last=bool(
-            training_config.get("drop_last", False)
+            training_config.get(
+                "drop_last",
+                False,
+            )
         ),
-        worker_init_fn=seed_data_loader_worker,
-        generator=create_data_loader_generator(random_seed),
-        persistent_workers=number_of_workers > 0,
+        worker_init_fn=(
+            seed_data_loader_worker
+        ),
+        generator=(
+            create_data_loader_generator(
+                random_seed
+            )
+        ),
+        persistent_workers=(
+            number_of_workers > 0
+        ),
     )
+
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=batch_size,
@@ -1008,11 +1678,17 @@ def main() -> None:
         num_workers=number_of_workers,
         pin_memory=pin_memory,
         drop_last=False,
-        worker_init_fn=seed_data_loader_worker,
-        persistent_workers=number_of_workers > 0,
+        worker_init_fn=(
+            seed_data_loader_worker
+        ),
+        persistent_workers=(
+            number_of_workers > 0
+        ),
     )
 
-    steps_per_epoch = len(training_loader)
+    steps_per_epoch = len(
+        training_loader
+    )
 
     if steps_per_epoch <= 0:
         raise RuntimeError(
@@ -1020,15 +1696,32 @@ def main() -> None:
             "请检查batch_size和drop_last。"
         )
 
-    number_of_epochs = int(training_config["number_of_epochs"])
+    # ------------------------------------------------------------------
+    # epoch → step
+    # ------------------------------------------------------------------
+
+    number_of_epochs = int(
+        training_config[
+            "number_of_epochs"
+        ]
+    )
+
     validate_every_epochs = int(
-        training_config["validate_every_epochs"]
+        training_config[
+            "validate_every_epochs"
+        ]
     )
+
     save_every_epochs = int(
-        training_config["save_every_epochs"]
+        training_config[
+            "save_every_epochs"
+        ]
     )
+
     log_every_batches = int(
-        training_config["log_every_batches"]
+        training_config[
+            "log_every_batches"
+        ]
     )
 
     if min(
@@ -1038,102 +1731,197 @@ def main() -> None:
         log_every_batches,
     ) <= 0:
         raise ValueError(
-            "训练epoch、验证频率、保存频率和日志频率必须大于0。"
+            "训练epoch、验证频率、"
+            "保存频率和日志频率必须大于0。"
         )
 
-    training_config["total_training_steps"] = (
-        number_of_epochs * steps_per_epoch
-    )
-    training_config["validate_every_steps"] = (
-        validate_every_epochs * steps_per_epoch
-    )
-    training_config["checkpoint_every_steps"] = (
-        save_every_epochs * steps_per_epoch
-    )
-    training_config["log_every_steps"] = log_every_batches
-
-    _, diffusion = build_diffusion_model(
-        model_configuration=configuration,
-        sequence_length=length_adapter.padded_length,
+    training_config[
+        "total_training_steps"
+    ] = (
+        number_of_epochs
+        * steps_per_epoch
     )
 
-    if physics_constraint_state is not None:
+    training_config[
+        "validate_every_steps"
+    ] = (
+        validate_every_epochs
+        * steps_per_epoch
+    )
+
+    training_config[
+        "checkpoint_every_steps"
+    ] = (
+        save_every_epochs
+        * steps_per_epoch
+    )
+
+    training_config[
+        "log_every_steps"
+    ] = log_every_batches
+
+    # ------------------------------------------------------------------
+    # 构建扩散模型
+    # ------------------------------------------------------------------
+
+    _, diffusion = (
+        build_diffusion_model(
+            model_configuration=configuration,
+            sequence_length=(
+                length_adapter.padded_length
+            ),
+        )
+    )
+
+    if (
+        physics_constraint_state
+        is not None
+    ):
         configure_physics = getattr(
             diffusion,
             "configure_physics_constraints",
             None,
         )
 
-        if not callable(configure_physics):
+        if not callable(
+            configure_physics
+        ):
             raise RuntimeError(
-                "D3.1扩散模型缺少configure_physics_constraints。"
+                "D3扩散模型缺少"
+                "configure_physics_constraints。"
             )
 
         configure_physics(
-            physics_constraint_state=physics_constraint_state,
-            prior_residual_state=prior_residual_state,
+            physics_constraint_state=(
+                physics_constraint_state
+            ),
+            prior_residual_state=(
+                prior_residual_state
+            ),
         )
 
-    if diversity_constraint_state is not None:
+    if (
+        diversity_constraint_state
+        is not None
+    ):
         configure_diversity = getattr(
             diffusion,
             "configure_diversity_constraints",
             None,
         )
 
-        if not callable(configure_diversity):
+        if not callable(
+            configure_diversity
+        ):
             raise RuntimeError(
-                "D3.4扩散模型缺少configure_diversity_constraints。"
+                "D3扩散模型缺少"
+                "configure_diversity_constraints。"
             )
 
         configure_diversity(
-            diversity_constraint_state=diversity_constraint_state,
+            diversity_constraint_state=(
+                diversity_constraint_state
+            ),
         )
 
-    checkpoint_manager = CheckpointManager(
-        resolve_project_path(
-            configuration,
-            output_config["checkpoint_directory"],
+    # ------------------------------------------------------------------
+    # checkpoint / metadata
+    # ------------------------------------------------------------------
+
+    checkpoint_manager = (
+        CheckpointManager(
+            resolve_project_path(
+                configuration,
+                output_config[
+                    "checkpoint_directory"
+                ],
+            )
         )
     )
+
     logger = TrainingLogger(
-        resolve_training_log_file(configuration)
+        resolve_training_log_file(
+            configuration
+        )
     )
 
-    axis_metadata = build_axis_metadata(
-        labels=collection.labels,
-        relative_source_files=collection.relative_source_files,
-        raman_shifts=collection.raman_shifts,
+    axis_metadata = (
+        build_axis_metadata(
+            labels=collection.labels,
+            relative_source_files=(
+                collection.relative_source_files
+            ),
+            raman_shifts=(
+                collection.raman_shifts
+            ),
+        )
     )
 
     metadata = {
-        "diagnostic_overfit": overfit_metadata,
-        "backend_package": "denoising-diffusion-pytorch",
-        "backend_version": get_backend_version(),
+        "diagnostic_overfit": (
+            overfit_metadata
+        ),
+        "backend_package": (
+            "denoising-diffusion-pytorch"
+        ),
+        "backend_version": (
+            get_backend_version()
+        ),
         "spectrum_names": [
-            str(value) for value in collection.spectrum_names
+            str(value)
+            for value
+            in collection.spectrum_names
         ],
         "source_files": [
-            str(value) for value in collection.source_files
+            str(value)
+            for value
+            in collection.source_files
         ],
         "relative_source_files": [
             str(value)
-            for value in collection.relative_source_files
+            for value
+            in collection.relative_source_files
         ],
-        "labels": [str(value) for value in collection.labels],
-        "number_of_spectra": int(number_of_spectra),
-        "training_indices": training_indices.tolist(),
-        "validation_indices": validation_indices.tolist(),
-        "test_indices": test_indices.tolist(),
-        "split_unit": str(data_config["split_unit"]),
-        "normalization_state": normalization_state,
-        "prior_residual_state": prior_residual_state,
-        "physics_constraint_state": physics_constraint_state,
-        "diversity_constraint_state": diversity_constraint_state,
+        "labels": [
+            str(value)
+            for value
+            in collection.labels
+        ],
+        "number_of_spectra": int(
+            number_of_spectra
+        ),
+        "training_indices": (
+            training_indices.tolist()
+        ),
+        "validation_indices": (
+            validation_indices.tolist()
+        ),
+        "test_indices": (
+            test_indices.tolist()
+        ),
+        "split_unit": str(
+            data_config[
+                "split_unit"
+            ]
+        ),
+        "normalization_state": (
+            normalization_state
+        ),
+        "prior_residual_state": (
+            prior_residual_state
+        ),
+        "physics_constraint_state": (
+            physics_constraint_state
+        ),
+        "diversity_constraint_state": (
+            diversity_constraint_state
+        ),
         "feature_peak_residual_limiter_state": (
             feature_peak_residual_limiter_state
         ),
-        "axis_metadata": axis_metadata,
+        "axis_metadata": (
+            axis_metadata
+        ),
         **length_adapter.to_metadata(),
     }
 
@@ -1144,51 +1932,147 @@ def main() -> None:
         device=device,
         configuration=configuration,
         metadata=metadata,
-        checkpoint_manager=checkpoint_manager,
+        checkpoint_manager=(
+            checkpoint_manager
+        ),
         logger=logger,
     )
 
+    # ------------------------------------------------------------------
+    # Resume
+    # ------------------------------------------------------------------
+
     if arguments.resume is not None:
-        resume_path = resolve_resume_path(
-            configuration=configuration,
-            resume_argument=arguments.resume,
+        resume_path = (
+            resolve_resume_path(
+                configuration=configuration,
+                resume_argument=arguments.resume,
+            )
         )
+
         validate_resume_stage(
             checkpoint_path=resume_path,
             configuration=configuration,
         )
-        trainer.resume(resume_path)
 
-    labels = sorted({str(value) for value in collection.labels})
-    original_lengths = sorted(
+        trainer.resume(
+            resume_path
+        )
+
+    # ------------------------------------------------------------------
+    # 终端摘要
+    # ------------------------------------------------------------------
+
+    labels = sorted(
         {
-            int(np.asarray(axis).size)
-            for axis in collection.raman_shifts
+            str(value)
+            for value
+            in collection.labels
         }
     )
 
-    print("\n===== 开始训练 =====")
-    print(f"设备：{device}")
-    print(f"实验名称：{project_config['name']}")
-    print(f"文件夹标签：{'、'.join(labels)}")
-    print(f"总光谱数量：{number_of_spectra}")
+    original_lengths = sorted(
+        {
+            int(
+                np.asarray(
+                    axis
+                ).size
+            )
+            for axis
+            in collection.raman_shifts
+        }
+    )
+
+    print(
+        "\n===== 开始训练 ====="
+    )
+
+    print(
+        f"设备：{device}"
+    )
+
+    print(
+        "实验名称："
+        f"{project_config['name']}"
+    )
+
+    print(
+        "文件夹标签："
+        f"{'、'.join(labels)}"
+    )
+
+    print(
+        "总光谱数量："
+        f"{number_of_spectra}"
+    )
+
     print(
         "训练/验证/测试光谱数量："
         f"{len(training_dataset)}/"
         f"{len(validation_dataset)}/"
         f"{len(test_dataset)}"
     )
-    print(f"各原始拉曼轴点数：{original_lengths}")
-    print(f"统一训练轴长度：{length_adapter.original_length}")
-    print(f"模型输入长度：{length_adapter.padded_length}")
-    print(f"末尾补齐点数：{length_adapter.padding_size}")
-    print(f"每个epoch的step：{steps_per_epoch}")
-    print(f"总训练step：{training_config['total_training_steps']}")
-    print("额外平滑或去基线：不执行")
+
     print(
-        "D3峰位置来源：每条真实目标光谱动态检测，"
-        "不使用固定峰窗口"
+        "各原始拉曼轴点数："
+        f"{original_lengths}"
     )
+
+    print(
+        "统一训练轴长度："
+        f"{length_adapter.original_length}"
+    )
+
+    print(
+        "模型输入长度："
+        f"{length_adapter.padded_length}"
+    )
+
+    print(
+        "末尾补齐点数："
+        f"{length_adapter.padding_size}"
+    )
+
+    print(
+        "每个epoch的step："
+        f"{steps_per_epoch}"
+    )
+
+    print(
+        "总训练step："
+        f"{training_config['total_training_steps']}"
+    )
+
+    print(
+        "真实输入光谱额外平滑或去基线：不执行"
+    )
+
+    if (
+        prior_residual_transformer
+        is not None
+        and prior_residual_transformer.prior_method
+        == "training_blended_frequency_median"
+    ):
+        print(
+            "D2.4说明：Gaussian低通只用于"
+            "train-only median prior的分解，"
+            "不会直接平滑任何真实训练/验证/测试光谱。"
+        )
+
+        print(
+            "D2.4共同峰骨架保留比例："
+            f"{prior_residual_transformer.blended_peak_component_ratio:g}"
+        )
+
+    if not bool(
+        physics_config.get(
+            "enabled",
+            False,
+        )
+    ):
+        print(
+            "D3物理/峰约束：未启用"
+        )
 
     if normalizer is not None:
         print(
@@ -1196,6 +2080,7 @@ def main() -> None:
             f"{float(normalizer.data_min):.8g}–"
             f"{float(normalizer.data_max):.8g}"
         )
+
         print(
             "模型缩放残差输入范围："
             f"{float(padded_spectra.min()):.8g}–"
@@ -1203,13 +2088,17 @@ def main() -> None:
         )
 
     if overfit_metadata is not None:
-        print("实验模式：单光谱重复过拟合诊断")
         print(
-            "注意：该模式的验证集和测试集也是同一光谱副本，"
-            "不能评价泛化性能。"
+            "实验模式：单光谱重复过拟合诊断"
         )
 
-    print("====================\n")
+        print(
+            "注意：该模式不能评价泛化性能。"
+        )
+
+    print(
+        "====================\n"
+    )
 
     trainer.train()
 

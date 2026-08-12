@@ -42,6 +42,9 @@ from src.spectrum_generator import (
 from src.spectrum_length_adapter import (
     SpectrumLengthAdapter,
 )
+from src.sers_sampling_calibrator import (
+    SersSamplingCalibrator,
+)
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -350,6 +353,54 @@ def load_checkpoint_feature_peak_residual_limiter(
 
     return FeaturePeakResidualLimiter.from_state_dict(limiter_state)
 
+
+def build_sampling_calibrator(
+    *,
+    generation_config: dict[str, Any],
+    prior_residual_transformer: PriorResidualTransformer | None,
+    length_adapter: SpectrumLengthAdapter,
+    output_raman_shifts: np.ndarray,
+    random_seed: int,
+) -> SersSamplingCalibrator | None:
+    """Build current-YAML sampling calibration from checkpoint PCA state."""
+
+    calibration_config = generation_config.get(
+        "sampling_calibration",
+        {"enabled": False},
+    ) or {"enabled": False}
+
+    if not isinstance(calibration_config, dict):
+        raise TypeError("generation.sampling_calibration必须是字典。")
+
+    if not bool(calibration_config.get("enabled", False)):
+        return None
+
+    if prior_residual_transformer is None:
+        raise RuntimeError(
+            "sampling_calibration要求checkpoint启用D2先验残差。"
+        )
+    if prior_residual_transformer.prior_method != "pca_reconstruction":
+        raise RuntimeError(
+            "当前sampling_calibration只支持pca_reconstruction先验。"
+        )
+    if prior_residual_transformer.pca_mean is None:
+        raise RuntimeError("checkpoint中的PCA状态缺少pca_mean。")
+
+    reference_on_output_axis = length_adapter.interpolate_from_model_axis(
+        np.asarray(
+            prior_residual_transformer.pca_mean,
+            dtype=np.float32,
+        ).reshape(1, -1),
+        output_raman_shifts,
+    )[0]
+
+    return SersSamplingCalibrator(
+        raman_shift=output_raman_shifts,
+        reference_spectrum=reference_on_output_axis,
+        configuration=calibration_config,
+        random_seed=random_seed,
+    )
+
 def main() -> None:
     """执行完整的光谱生成和导出流程。"""
 
@@ -642,6 +693,21 @@ def main() -> None:
             "generation.batch_size必须大于0。"
         )
 
+    variation_scale = float(
+        generation_config.get(
+            "variation_scale",
+            1.0,
+        )
+    )
+
+    sampling_calibrator = build_sampling_calibrator(
+        generation_config=generation_config,
+        prior_residual_transformer=prior_residual_transformer,
+        length_adapter=length_adapter,
+        output_raman_shifts=output_raman_shifts,
+        random_seed=random_seed,
+    )
+
     # 生成器先删除模型末尾补齐点。
     # D2检查点随后在统一训练轴上恢复完整归一化光谱，
     # 最后插值回当前标签的原始位移轴。
@@ -663,6 +729,8 @@ def main() -> None:
             feature_peak_residual_limiter
         ),
         prior_random_seed=random_seed,
+        variation_scale=variation_scale,
+        sampling_calibrator=sampling_calibrator,
     )
 
     inverse_normalizer = None
@@ -821,6 +889,50 @@ def main() -> None:
         f"生成数量："
         f"{spectra.shape[0]}"
     )
+    if variation_scale < 1.0:
+        print(
+            "生成离散度校准：已启用；"
+            f"variation_scale={variation_scale:.3f}；"
+            "中心为checkpoint中的PCA均值谱"
+        )
+    else:
+        print(
+            "生成离散度校准：未启用"
+        )
+    if sampling_calibrator is not None:
+        calibration_summary = sampling_calibrator.summary()
+        print(
+            "非峰区杂讯频带校准："
+            + (
+                "已启用；自动保护峰数"
+                f"{calibration_summary['detected_peak_count']}；"
+                "中频缩放"
+                f"{calibration_summary['middle_component_scale']:.3f}；"
+                "细频缩放"
+                f"{calibration_summary['fine_component_scale']:.3f}；"
+                "95%杂讯带宽"
+                f"{calibration_summary['noise_width_before']:.6g}→"
+                f"{calibration_summary['noise_width_after']:.6g}"
+                if calibration_summary["non_peak_noise_enabled"]
+                else "未启用"
+            )
+        )
+        if calibration_summary["raman_shift_jitter_enabled"]:
+            print(
+                "整谱拉曼轴微漂移：已启用；"
+                "允许范围±"
+                f"{calibration_summary['maximum_absolute_shift_cm1']:.3f} cm⁻¹；"
+                "本批实际范围"
+                f"{calibration_summary['sampled_shift_min_cm1']:.3f}–"
+                f"{calibration_summary['sampled_shift_max_cm1']:.3f} cm⁻¹；"
+                "标准差"
+                f"{calibration_summary['sampled_shift_std_cm1']:.3f} cm⁻¹"
+            )
+        else:
+            print("整谱拉曼轴微漂移：未启用")
+    else:
+        print("非峰区杂讯频带校准：未启用")
+        print("整谱拉曼轴微漂移：未启用")
     if feature_peak_residual_limiter is not None:
         limiter_summary = feature_peak_residual_limiter.summary()
         print(
