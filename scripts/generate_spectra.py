@@ -30,6 +30,9 @@ from src.model_builder import (
 from src.prior_residual import (
     PriorResidualTransformer,
 )
+from src.broad_local_residual import (
+    BroadLocalResidualDecomposer,
+)
 from src.random_seed_manager import (
     set_random_seed,
 )
@@ -106,6 +109,20 @@ def parse_arguments() -> argparse.Namespace:
             "raw为普通训练模型，ema为EMA模型。"
             "默认读取generation.model_source；"
             "若配置中未设置，则默认使用raw。"
+        ),
+    )
+
+    parser.add_argument(
+        "--pca-score-clip-standard-deviations",
+        type=float,
+        default=None,
+        help=(
+            "仅在本次生成进程中覆盖PCA prior score的"
+            "截断标准差倍数。"
+            "只对pca_reconstruction有效；"
+            "不会修改checkpoint。"
+            "命令行优先级高于"
+            "generation.pca_score_clip_override_standard_deviations。"
         ),
     )
 
@@ -194,6 +211,128 @@ def resolve_requested_model_source(
         )
 
     return model_source
+
+
+def apply_pca_score_clip_runtime_override(
+    *,
+    arguments: argparse.Namespace,
+    generation_config: dict[str, Any],
+    prior_residual_transformer: (
+        PriorResidualTransformer | None
+    ),
+) -> dict[str, Any]:
+    # 对PCA prior score截断范围执行“仅当前进程”的生成端覆盖。
+    #
+    # 优先级：
+    # CLI > current YAML generation配置 > checkpoint原值。
+    #
+    # 这里只修改由checkpoint state恢复出来的
+    # PriorResidualTransformer内存对象，
+    # 不修改checkpoint字典，也不会写回.pt文件。
+
+    cli_value = getattr(
+        arguments,
+        "pca_score_clip_standard_deviations",
+        None,
+    )
+
+    yaml_value = generation_config.get(
+        "pca_score_clip_override_standard_deviations",
+        None,
+    )
+
+    if cli_value is not None:
+        requested_value = float(cli_value)
+        source = "command_line"
+
+    elif yaml_value is not None:
+        requested_value = float(yaml_value)
+        source = "yaml"
+
+    else:
+        requested_value = None
+        source = "checkpoint"
+
+    if prior_residual_transformer is None:
+        if requested_value is not None:
+            raise ValueError(
+                "指定了PCA score clip生成覆盖，"
+                "但当前checkpoint没有启用prior_residual。"
+            )
+
+        return {
+            "active": False,
+            "source": "not_applicable",
+            "checkpoint_value": None,
+            "runtime_value": None,
+            "overridden": False,
+        }
+
+    if (
+        prior_residual_transformer.prior_method
+        != "pca_reconstruction"
+    ):
+        if requested_value is not None:
+            raise ValueError(
+                "指定了PCA score clip生成覆盖，"
+                "但当前checkpoint的prior_method不是"
+                "pca_reconstruction。"
+            )
+
+        return {
+            "active": False,
+            "source": "not_applicable",
+            "checkpoint_value": None,
+            "runtime_value": None,
+            "overridden": False,
+        }
+
+    checkpoint_value = float(
+        prior_residual_transformer
+        .pca_score_clip_standard_deviations
+    )
+
+    if (
+        not np.isfinite(checkpoint_value)
+        or checkpoint_value <= 0.0
+    ):
+        raise RuntimeError(
+            "checkpoint恢复出的PCA score clip无效："
+            f"{checkpoint_value}。"
+        )
+
+    if requested_value is None:
+        runtime_value = checkpoint_value
+
+    else:
+        if (
+            not np.isfinite(requested_value)
+            or requested_value <= 0.0
+        ):
+            raise ValueError(
+                "PCA score clip生成覆盖必须是有限正数。"
+            )
+
+        runtime_value = requested_value
+
+    prior_residual_transformer.pca_score_clip_standard_deviations = (
+        float(runtime_value)
+    )
+
+    overridden = not np.isclose(
+        runtime_value,
+        checkpoint_value,
+        rtol=0.0,
+        atol=1.0e-12,
+    )
+
+    return {
+        "active": True,
+        "source": source,
+        "checkpoint_value": checkpoint_value,
+        "runtime_value": float(runtime_value),
+        "overridden": bool(overridden),
+    }
 
 
 def build_safe_label_name(
@@ -401,6 +540,85 @@ def build_sampling_calibrator(
         random_seed=random_seed,
     )
 
+def load_checkpoint_broad_local_residual(
+    *,
+    checkpoint_configuration: dict[str, Any],
+    metadata: dict[str, Any],
+) -> BroadLocalResidualDecomposer | None:
+    configuration = (
+        checkpoint_configuration.get(
+            "broad_local_residual",
+            {
+                "enabled": False,
+            },
+        )
+        or {
+            "enabled": False,
+        }
+    )
+
+    if not isinstance(
+        configuration,
+        dict,
+    ):
+        raise TypeError(
+            "checkpoint中的broad_local_residual配置必须是字典。"
+        )
+
+    enabled_in_configuration = bool(
+        configuration.get(
+            "enabled",
+            False,
+        )
+    )
+
+    state = metadata.get(
+        "broad_local_residual_state"
+    )
+
+    if state is None:
+        if enabled_in_configuration:
+            raise KeyError(
+                "checkpoint启用了D2.6，"
+                "但metadata中缺少broad_local_residual_state。"
+            )
+
+        return None
+
+    if not isinstance(
+        state,
+        dict,
+    ):
+        raise TypeError(
+            "broad_local_residual_state必须是字典。"
+        )
+
+    enabled_in_state = bool(
+        state.get(
+            "enabled",
+            False,
+        )
+    )
+
+    if (
+        enabled_in_state
+        != enabled_in_configuration
+    ):
+        raise ValueError(
+            "checkpoint配置与D2.6 state启用状态不一致。"
+        )
+
+    if not enabled_in_state:
+        return None
+
+    return (
+        BroadLocalResidualDecomposer
+        .from_state_dict(
+            state
+        )
+    )
+
+
 def main() -> None:
     """执行完整的光谱生成和导出流程。"""
 
@@ -586,6 +804,37 @@ def main() -> None:
     # D0和D1旧检查点没有prior_residual配置，
     # 此时prior_residual_transformer保持为None。
 
+    pca_score_clip_runtime = (
+        apply_pca_score_clip_runtime_override(
+            arguments=arguments,
+            generation_config=generation_config,
+            prior_residual_transformer=(
+                prior_residual_transformer
+            ),
+        )
+    )
+
+    broad_local_residual_decomposer = (
+        load_checkpoint_broad_local_residual(
+            checkpoint_configuration=(
+                checkpoint_configuration
+            ),
+            metadata=metadata,
+        )
+    )
+
+    if (
+        broad_local_residual_decomposer is not None
+        and (
+            prior_residual_transformer is None
+            or prior_residual_transformer.prior_method
+            != "pca_reconstruction"
+        )
+    ):
+        raise RuntimeError(
+            "D2.6 checkpoint必须同时包含PCA outer prior state。"
+        )
+
     # 必须传入检查点中的完整配置，
     # 使model和diffusion两个区段同时生效。
     _, diffusion = build_diffusion_model(
@@ -724,6 +973,9 @@ def main() -> None:
         ),
         prior_residual_transformer=(
             prior_residual_transformer
+        ),
+        broad_local_residual_decomposer=(
+            broad_local_residual_decomposer
         ),
         feature_peak_residual_limiter=(
             feature_peak_residual_limiter
@@ -866,6 +1118,65 @@ def main() -> None:
     print(f"检查点：{checkpoint_path}")
     print(f"检查点步数：{checkpoint_step}")
     print(f"使用模型：{model_source_text}")
+
+    if pca_score_clip_runtime["active"]:
+        print(
+            "PCA score截断范围："
+            "checkpoint=±"
+            f"{pca_score_clip_runtime['checkpoint_value']:.6g}σ；"
+            "本次runtime=±"
+            f"{pca_score_clip_runtime['runtime_value']:.6g}σ"
+        )
+
+        print(
+            "PCA score截断来源："
+            f"{pca_score_clip_runtime['source']}"
+        )
+
+        if pca_score_clip_runtime["overridden"]:
+            print(
+                "PCA score runtime override：已启用；"
+                "checkpoint文件未修改"
+            )
+        else:
+            print(
+                "PCA score runtime override：未启用；"
+                "使用checkpoint原值"
+            )
+
+    if broad_local_residual_decomposer is not None:
+        broad_local_summary = (
+            broad_local_residual_decomposer.summary()
+        )
+
+        print(
+            "D2.6 broad-local residual：已启用"
+        )
+
+        print(
+            "D2.6 DDPM输出域：scaled local residual"
+        )
+
+        print(
+            "D2.6 broad sampler：train-only PCA；"
+            "组件数="
+            f"{broad_local_summary['broad_pca_components']}；"
+            "累计解释方差="
+            f"{broad_local_summary['broad_pca_cumulative_explained_variance']:.6f}；"
+            "score截断=±"
+            f"{broad_local_summary['broad_score_clip_standard_deviations']:.6g}σ"
+        )
+
+        print(
+            "D2.6 broad Gaussian sigma："
+            f"{broad_local_summary['broad_sigma_cm1']:.6g} cm^-1"
+        )
+
+    else:
+        print(
+            "D2.6 broad-local residual：未启用"
+        )
+
     print(f"输出标签：{resolved_label}")
     print(f"位移轴配置ID：{profile_id}")
     print(
@@ -906,6 +1217,8 @@ def main() -> None:
             + (
                 "已启用；自动保护峰数"
                 f"{calibration_summary['detected_peak_count']}；"
+                "宽背景离散缩放"
+                f"{calibration_summary['broad_variation_scale']:.3f}；"
                 "中频缩放"
                 f"{calibration_summary['middle_component_scale']:.3f}；"
                 "细频缩放"

@@ -1010,3 +1010,192 @@ def test_sampling_calibration_adds_coherent_bounded_peak_shift():
         rtol=0.0,
         atol=0.0,
     )
+
+
+def test_pca_score_clip_runtime_override_uses_cli_and_preserves_checkpoint_state():
+    # CLI只修改恢复后的内存transformer，不修改原checkpoint state。
+
+    from argparse import Namespace
+
+    from scripts.generate_spectra import (
+        apply_pca_score_clip_runtime_override,
+    )
+
+    rng = np.random.default_rng(20260814)
+
+    training_spectra = rng.normal(
+        loc=0.0,
+        scale=0.25,
+        size=(16, 32),
+    ).astype(np.float32)
+
+    fitted = PriorResidualTransformer(
+        prior_method="pca_reconstruction",
+        normalization_method="robust_asinh",
+        residual_quantile=99.5,
+        target_abs_max=1.0,
+        pca_explained_variance_ratio=0.95,
+        pca_max_components=6,
+        pca_sampling_strategy=(
+            "independent_truncated_gaussian_scores"
+        ),
+        pca_score_clip_standard_deviations=1.5,
+    ).fit(training_spectra)
+
+    checkpoint_state = fitted.state_dict()
+
+    assert (
+        checkpoint_state["pca_prior"][
+            "score_clip_standard_deviations"
+        ]
+        == 1.5
+    )
+
+    restored = PriorResidualTransformer.from_state_dict(
+        checkpoint_state
+    )
+
+    arguments = Namespace(
+        pca_score_clip_standard_deviations=2.5,
+    )
+
+    information = (
+        apply_pca_score_clip_runtime_override(
+            arguments=arguments,
+            generation_config={
+                "pca_score_clip_override_standard_deviations": 2.0,
+            },
+            prior_residual_transformer=restored,
+        )
+    )
+
+    assert information["active"]
+    assert information["source"] == "command_line"
+    assert information["overridden"]
+    assert information["checkpoint_value"] == 1.5
+    assert information["runtime_value"] == 2.5
+
+    assert (
+        restored.pca_score_clip_standard_deviations
+        == 2.5
+    )
+
+    assert (
+        checkpoint_state["pca_prior"][
+            "score_clip_standard_deviations"
+        ]
+        == 1.5
+    )
+
+
+def test_pca_score_clip_2_5_restores_more_prior_score_dispersion_than_1_5():
+    # 相同PCA状态下，2.5σ应比1.5σ恢复更多score方差。
+
+    rng = np.random.default_rng(20260815)
+
+    training_spectra = rng.normal(
+        loc=0.0,
+        scale=0.25,
+        size=(16, 32),
+    ).astype(np.float32)
+
+    fitted = PriorResidualTransformer(
+        prior_method="pca_reconstruction",
+        normalization_method="robust_asinh",
+        residual_quantile=99.5,
+        target_abs_max=1.0,
+        pca_explained_variance_ratio=0.95,
+        pca_max_components=6,
+        pca_sampling_strategy=(
+            "independent_truncated_gaussian_scores"
+        ),
+        pca_score_clip_standard_deviations=1.5,
+    ).fit(training_spectra)
+
+    state = fitted.state_dict()
+
+    transformer_1_5 = (
+        PriorResidualTransformer.from_state_dict(
+            state
+        )
+    )
+
+    transformer_2_5 = (
+        PriorResidualTransformer.from_state_dict(
+            state
+        )
+    )
+
+    transformer_2_5.pca_score_clip_standard_deviations = (
+        2.5
+    )
+
+    prior_1_5 = (
+        transformer_1_5.sample_reference_priors(
+            12000,
+            random_generator=np.random.default_rng(
+                2026
+            ),
+        )
+    )
+
+    prior_2_5 = (
+        transformer_2_5.sample_reference_priors(
+            12000,
+            random_generator=np.random.default_rng(
+                2026
+            ),
+        )
+    )
+
+    def standardized_score_std(
+        transformer,
+        priors,
+    ):
+        centered = (
+            priors.astype(np.float64)
+            - transformer.pca_mean[
+                np.newaxis,
+                :
+            ]
+        )
+
+        scores = (
+            centered
+            @ transformer.pca_components.T
+        )
+
+        standardized = (
+            scores
+            - transformer.pca_training_score_mean[
+                np.newaxis,
+                :
+            ]
+        ) / transformer.pca_score_standard_deviation[
+            np.newaxis,
+            :
+        ]
+
+        return float(
+            np.mean(
+                np.std(
+                    standardized,
+                    axis=0,
+                    ddof=0,
+                )
+            )
+        )
+
+    std_1_5 = standardized_score_std(
+        transformer_1_5,
+        prior_1_5,
+    )
+
+    std_2_5 = standardized_score_std(
+        transformer_2_5,
+        prior_2_5,
+    )
+
+    assert 0.70 < std_1_5 < 0.79
+    assert 0.91 < std_2_5 < 0.99
+    assert std_2_5 > 1.20 * std_1_5

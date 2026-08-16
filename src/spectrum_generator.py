@@ -9,6 +9,9 @@ from torch import nn
 from src.prior_residual import (
     PriorResidualTransformer,
 )
+from src.broad_local_residual import (
+    BroadLocalResidualDecomposer,
+)
 from src.feature_peak_residual_limiter import (
     FeaturePeakResidualLimiter,
 )
@@ -31,6 +34,9 @@ def generate_spectra(
     output_raman_shifts: np.ndarray | None = None,
     prior_residual_transformer: (
         PriorResidualTransformer | None
+    ) = None,
+    broad_local_residual_decomposer: (
+        BroadLocalResidualDecomposer | None
     ) = None,
     feature_peak_residual_limiter: (
         FeaturePeakResidualLimiter | None
@@ -66,6 +72,26 @@ def generate_spectra(
         raise ValueError(
             "D3.5特征峰残差软上限必须与D2先验残差变换器一起使用。"
         )
+
+    if broad_local_residual_decomposer is not None:
+        if prior_residual_transformer is None:
+            raise ValueError(
+                "D2.6 broad-local residual必须与"
+                "PCA prior_residual_transformer一起使用。"
+            )
+
+        if (
+            prior_residual_transformer.prior_method
+            != "pca_reconstruction"
+        ):
+            raise ValueError(
+                "D2.6当前只支持pca_reconstruction outer prior。"
+            )
+
+        if feature_peak_residual_limiter is not None:
+            raise ValueError(
+                "D2.6第一轮消融不与D3.5 limiter组合。"
+            )
 
     variation_scale = float(variation_scale)
 
@@ -144,7 +170,25 @@ def generate_spectra(
     diffusion = diffusion.to(device)
     diffusion.eval()
 
-    prior_random_generator = np.random.default_rng(prior_random_seed)
+    prior_random_generator = np.random.default_rng(
+        prior_random_seed
+    )
+
+    broad_random_generator = None
+
+    if broad_local_residual_decomposer is not None:
+        broad_random_seed = (
+            None
+            if prior_random_seed is None
+            else int(prior_random_seed)
+            + 1_000_003
+        )
+
+        broad_random_generator = (
+            np.random.default_rng(
+                broad_random_seed
+            )
+        )
 
     generated_batches: list[np.ndarray] = []
     number_generated = 0
@@ -202,6 +246,7 @@ def generate_spectra(
             is not None
         ):
             reference_priors = None
+
             if (
                 prior_residual_transformer.prior_method
                 == "pca_reconstruction"
@@ -212,13 +257,52 @@ def generate_spectra(
                         random_generator=prior_random_generator,
                     )
                 )
-            restored = (
-                prior_residual_transformer
-                .inverse_transform(
-                    restored,
-                    reference_priors=reference_priors,
+
+            if broad_local_residual_decomposer is not None:
+                if reference_priors is None:
+                    raise RuntimeError(
+                        "D2.6生成缺少outer PCA reference priors。"
+                    )
+
+                if broad_random_generator is None:
+                    raise RuntimeError(
+                        "D2.6生成缺少broad随机数生成器。"
+                    )
+
+                local_raw_residuals = (
+                    broad_local_residual_decomposer
+                    .inverse_local_transform(
+                        restored
+                    )
                 )
-            )
+
+                sampled_broad_residuals = (
+                    broad_local_residual_decomposer
+                    .sample_broad_residuals(
+                        current_batch_size,
+                        random_generator=(
+                            broad_random_generator
+                        ),
+                    )
+                )
+
+                restored = (
+                    reference_priors
+                    + sampled_broad_residuals
+                    + local_raw_residuals
+                ).astype(
+                    np.float32,
+                    copy=False,
+                )
+
+            else:
+                restored = (
+                    prior_residual_transformer
+                    .inverse_transform(
+                        restored,
+                        reference_priors=reference_priors,
+                    )
+                )
 
         # D2.5最终生成离散度校准：
         # 完整归一化光谱重建完成后，以checkpoint中训练集

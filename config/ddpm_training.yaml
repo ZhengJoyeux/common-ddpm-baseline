@@ -3,7 +3,7 @@ project:
   # 3-component stochastic PCA prior
   # + robust_asinh residual
   # + ordinary unconditional DDPM
-  name: d2_5_pca3_robust_asinh_s001_1200
+  name: d2_6_broad_local_pca6_robust_asinh_s001_1200
 
   random_seed: 2026
 
@@ -116,8 +116,7 @@ prior_residual:
   # 对当前16条训练谱，最终应显示PCA主成分数为3。
   pca_explained_variance_ratio: 0.95
 
-  pca_max_components: 3
-
+  pca_max_components: 6
   # 使用真正的逐主成分截断高斯采样。
   # 旧的truncated_gaussian_scores实际是采样后clip，
   # 会在±1.5标准差边界堆积大量prior，本轮不使用。
@@ -125,8 +124,7 @@ prior_residual:
 
   # 将每个PCA score限制在训练均值±1.5个标准差内，
   # 减少小样本高斯外推产生的异常prior。
-  pca_score_clip_standard_deviations: 1.5
-
+  pca_score_clip_standard_deviations: 2.5
   # ------------------------------------------------------------
   # 必须使用 robust_asinh。
   #
@@ -166,6 +164,42 @@ prior_residual:
 #
 # 不能同时混入D3，否则无法判断D2.4是否有效。
 # ==============================================================
+
+
+# ----------------------------------------------------------------------
+# D2.6：broad-local residual decomposition
+#
+# outer prior仍是D2.5 PCA6。
+# raw residual = normalized spectrum - PCA6 reconstruction
+# residual = broad + local
+#
+# broad：train-only PCA低维采样；
+# local：robust_asinh后交给DDPM学习。
+#
+# 该模块属于模型/残差表示改进，不是sampling post-processing。
+# ----------------------------------------------------------------------
+broad_local_residual:
+  enabled: true
+
+  broad_filter:
+    method: gaussian
+    sigma_cm1: 7.0
+    truncate: 4.0
+
+  broad_prior:
+    method: pca
+    pca_explained_variance_ratio: 0.95
+    pca_max_components: 6
+    sampling_strategy: independent_truncated_gaussian_scores
+    score_clip_standard_deviations: 2.5
+
+  local_normalization:
+    method: robust_asinh
+    residual_quantile: 99.5
+    target_abs_max: 1.0
+
+  epsilon: 1.0e-8
+
 
 physics_constraints:
   enabled: false
@@ -281,15 +315,15 @@ training:
 
 
 output:
-  output_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200
+  output_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200
 
-  checkpoint_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/checkpoints
+  checkpoint_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/checkpoints
 
-  log_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/logs
+  log_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/logs
 
-  generated_spectrum_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/generated/ddim50_ema_targeted_calibration
+  generated_spectrum_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/generated/ddim50_ema_no_sampling_calibration
 
-  preview_plot_directory: outputs/experiments/d2_5_pca3_robust_asinh_s001_1200/plots/ddim50_ema_targeted_calibration
+  preview_plot_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/plots/ddim50_ema_no_sampling_calibration
 
   latest_checkpoint_name: latest.pt
 
@@ -316,11 +350,15 @@ generation:
   # 不能针对性解决非峰区杂讯带过宽的问题。
   variation_scale: 1.00
 
+  # PCA prior score截断的生成端临时覆盖。
+  # null表示严格使用checkpoint原值；实验时优先用CLI覆盖。
+  # 该字段不会写回checkpoint。
+  pca_score_clip_override_standard_deviations: null
   # D2.5生成阶段定向校准，不修改best.pt，也不重新训练。
   # 所有峰区均从checkpoint中的训练集PCA均值谱自动检测，
   # 不写死任何农药或特征峰位置。
   sampling_calibration:
-    enabled: true
+    enabled: false
 
     # 只压缩非峰区的宽杂讯成分；自动识别出的峰区保持原样。
     non_peak_noise:
@@ -342,6 +380,7 @@ generation:
       # fine保留0.85，避免把真实SERS细噪声全部抹平。
       fine_sigma_cm1: 1.5
       broad_sigma_cm1: 7.0
+      broad_variation_scale: 0.46
       middle_component_scale: 0.55
       fine_component_scale: 0.85
 
@@ -352,6 +391,73 @@ generation:
       distribution: truncated_normal
       standard_deviation_cm1: 3.0
       maximum_absolute_shift_cm1: 5.0
+
+
+  # ------------------------------------------------------------
+  # 实验C：训练集驱动的生成光谱质量guard
+  #
+  # 注意：
+  # 1. 只根据checkpoint记录的真实训练集拟合；
+  # 2. 峰位自动检测，不写死任何农药峰位；
+  # 3. 只做接受/拒绝，不修改光谱强度；
+  # 4. 当前broad calibration继续保持关闭。
+  # ------------------------------------------------------------
+  training_guard:
+    enabled: true
+
+    reference_smoothing_sigma_cm1: 30.0
+    minimum_relative_prominence: 0.06
+    minimum_peak_distance_cm1: 12.0
+    maximum_peak_count: 20
+
+    metric_half_width_cm1: 24.0
+
+    # 峰位边界 = 训练集观测最小/最大值 ± 2 cm^-1。
+    position_margin_cm1: 2.0
+
+    # 峰高、FWHM和负谷使用训练范围 + 1.5×IQR作为宽松保护边界。
+    # 这是outlier guard，不是把生成分布压回训练均值。
+    bound_margin_iqr: 1.5
+
+    minimum_valid_training_count: 8
+
+    # 只把训练集中稳定的主要峰用于质量guard。
+    # 候选峰的训练峰高中位数必须达到
+    # 全部候选峰最大中位峰高的5%。
+    # 完全由当前训练集自动计算，不写死任何峰位。
+    minimum_guard_peak_median_height_fraction: 0.05
+
+    check_peak_position: true
+    check_peak_height: true
+    check_peak_width: true
+    check_negative_minimum: true
+
+    # 允许少量自动峰出现单次指标越界。
+    # 超过20%的guard峰越界才拒绝整条光谱。
+    maximum_peak_violation_fraction: 0.20
+
+
+  # ------------------------------------------------------------
+  # Experiment D：最终生成光谱统一评价
+  #
+  # 只做评价，不训练、不生成、不校准、不修改任何生成光谱。
+  # PCA及所有参考统计只在checkpoint记录的training split上拟合。
+  # validation/test仅作为held-out参考，不用于调参。
+  # ------------------------------------------------------------
+  final_evaluation:
+    random_seed: 2026
+
+    # 与当前PCA6生成模型保持一致，评价PCA也使用6维训练集子空间。
+    pca_components: 6
+
+    # 真实train=16条时，每次从生成谱中随机抽16条做公平分布比较。
+    bootstrap_repeats: 500
+
+    # 生成谱内部成对多样性随机抽样数量；代码使用分块计算避免占满内存。
+    generated_pair_count: 50000
+
+    # 与前面A/B诊断保持一致的broad低频分解尺度。
+    broad_sigma_cm1: 7.0
 
   output_filename: generated_spectra.xlsx
 

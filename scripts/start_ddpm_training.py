@@ -80,6 +80,9 @@ from src.one_dimensional_ddpm import (
 from src.prior_residual import (
     PriorResidualTransformer,
 )
+from src.broad_local_residual import (
+    BroadLocalResidualDecomposer,
+)
 from src.random_seed_manager import (
     create_data_loader_generator,
     seed_data_loader_worker,
@@ -545,6 +548,10 @@ def validate_resume_stage(
             "D2先验残差",
         ),
         (
+            "broad_local_residual",
+            "D2.6 broad-local residual",
+        ),
+        (
             "physics_constraints",
             "D3物理约束",
         ),
@@ -885,6 +892,114 @@ def print_prior_residual_summary(
     )
 
 
+def print_broad_local_residual_summary(
+    decomposer: BroadLocalResidualDecomposer | None,
+    training_scaled_local_residuals: np.ndarray | None,
+) -> None:
+    if decomposer is None:
+        print(
+            "D2.6 broad-local residual：未启用"
+        )
+        return
+
+    if training_scaled_local_residuals is None:
+        raise RuntimeError(
+            "D2.6已启用，但缺少训练local residual统计。"
+        )
+
+    summary = decomposer.summary()
+
+    print(
+        "\n===== D2.6 broad-local residual状态 ====="
+    )
+
+    print(
+        "broad Gaussian sigma："
+        f"{summary['broad_sigma_cm1']:.6g} cm^-1"
+    )
+
+    print(
+        "broad PCA主成分数："
+        f"{summary['broad_pca_components']}"
+    )
+
+    print(
+        "broad PCA累计解释方差："
+        f"{summary['broad_pca_cumulative_explained_variance']:.6f}"
+    )
+
+    print(
+        "broad PCA score截断：±"
+        f"{summary['broad_score_clip_standard_deviations']:.6g}σ"
+    )
+
+    print(
+        "local normalization：robust_asinh"
+    )
+
+    print(
+        "local residual scale："
+        f"{summary['local_residual_scale']:.8g}"
+    )
+
+    print(
+        "local asinh normalizer："
+        f"{summary['local_asinh_normalizer']:.8g}"
+    )
+
+    print(
+        "训练raw residual RMS中位数："
+        f"{summary['training_raw_rms_median']:.8g}"
+    )
+
+    print(
+        "训练broad residual RMS中位数："
+        f"{summary['training_broad_rms_median']:.8g}"
+    )
+
+    print(
+        "训练local residual RMS中位数："
+        f"{summary['training_local_rms_median']:.8g}"
+    )
+
+    absolute = np.abs(
+        np.asarray(
+            training_scaled_local_residuals,
+            dtype=np.float64,
+        )
+    )
+
+    for name, percentile in (
+        ("p50", 50.0),
+        ("p90", 90.0),
+        ("p95", 95.0),
+        ("p99", 99.0),
+        ("p99.5", 99.5),
+        ("p99.9", 99.9),
+        ("max", 100.0),
+    ):
+        value = float(
+            np.percentile(
+                absolute,
+                percentile,
+            )
+        )
+
+        print(
+            "训练scaled local residual "
+            f"{name}: {value:.8g}"
+        )
+
+    print(
+        "D2.6模型输入：只训练local residual；"
+        "broad residual由train-only broad PCA生成。"
+    )
+
+    print(
+        "========================================\n"
+    )
+
+
 def print_physics_summary(
     state: dict | None,
 ) -> None:
@@ -987,12 +1102,99 @@ def main() -> None:
         {},
     ) or {}
 
+    broad_local_config = configuration.get(
+        "broad_local_residual",
+        {
+            "enabled": False,
+        },
+    ) or {
+        "enabled": False,
+    }
+
+    if not isinstance(
+        broad_local_config,
+        dict,
+    ):
+        raise TypeError(
+            "broad_local_residual配置必须是字典。"
+        )
+
+    broad_local_enabled = bool(
+        broad_local_config.get(
+            "enabled",
+            False,
+        )
+    )
+
     physics_config = configuration.get(
         "physics_constraints",
         {
             "enabled": False,
         },
     )
+
+    if broad_local_enabled:
+        if not bool(
+            prior_config.get(
+                "enabled",
+                False,
+            )
+        ):
+            raise ValueError(
+                "D2.6要求prior_residual.enabled=true。"
+            )
+
+        if str(
+            prior_config.get(
+                "prior_method",
+                "",
+            )
+        ).strip().lower() != "pca_reconstruction":
+            raise ValueError(
+                "D2.6当前只支持"
+                "prior_residual.prior_method=pca_reconstruction。"
+            )
+
+        incompatible_sections = (
+            "physics_constraints",
+            "diversity_constraints",
+            "feature_peak_residual_limiter",
+            "local_peak_distribution_constraints",
+        )
+
+        enabled_incompatible = []
+
+        for section_name in incompatible_sections:
+            section = (
+                configuration.get(
+                    section_name,
+                    {},
+                )
+                or {}
+            )
+
+            if (
+                isinstance(
+                    section,
+                    dict,
+                )
+                and bool(
+                    section.get(
+                        "enabled",
+                        False,
+                    )
+                )
+            ):
+                enabled_incompatible.append(
+                    section_name
+                )
+
+        if enabled_incompatible:
+            raise ValueError(
+                "D2.6第一轮消融要求关闭全部D3模块；"
+                "当前仍启用："
+                f"{enabled_incompatible}。"
+            )
 
     training_config = configuration[
         "training"
@@ -1235,6 +1437,12 @@ def main() -> None:
 
     prior_residual_state = None
 
+    broad_local_residual_decomposer: (
+        BroadLocalResidualDecomposer | None
+    ) = None
+
+    broad_local_residual_state = None
+
     spectra_for_model = (
         normalized_full_spectra.copy()
     )
@@ -1383,7 +1591,11 @@ def main() -> None:
             ),
         )
 
-        training_scaled_residuals = (
+        prior_residual_state = (
+            prior_residual_transformer.state_dict()
+        )
+
+        prior_summary_scaled_residuals = (
             prior_residual_transformer.transform(
                 normalized_full_spectra[
                     training_indices
@@ -1391,19 +1603,95 @@ def main() -> None:
             )
         )
 
-        spectra_for_model = (
-            prior_residual_transformer.transform(
-                normalized_full_spectra
-            )
-        )
+        if broad_local_enabled:
+            if (
+                prior_residual_transformer.prior_method
+                != "pca_reconstruction"
+            ):
+                raise RuntimeError(
+                    "D2.6要求已拟合PCA outer prior。"
+                )
 
-        prior_residual_state = (
-            prior_residual_transformer.state_dict()
-        )
+            reference_priors_full = (
+                prior_residual_transformer
+                .reference_priors_for_spectra(
+                    normalized_full_spectra
+                )
+            )
+
+            raw_residuals_full = (
+                normalized_full_spectra
+                - reference_priors_full
+            ).astype(
+                np.float32,
+                copy=False,
+            )
+
+            broad_local_residual_decomposer = (
+                BroadLocalResidualDecomposer
+                .from_configuration(
+                    broad_local_config
+                )
+            )
+
+            broad_local_residual_decomposer.fit(
+                raw_residuals_full[
+                    training_indices
+                ],
+                raman_shift=np.asarray(
+                    length_adapter.model_raman_shift,
+                    dtype=np.float64,
+                ),
+            )
+
+            training_scaled_residuals = (
+                broad_local_residual_decomposer
+                .transform_raw_residuals(
+                    raw_residuals_full[
+                        training_indices
+                    ]
+                )
+            )
+
+            spectra_for_model = (
+                broad_local_residual_decomposer
+                .transform_raw_residuals(
+                    raw_residuals_full
+                )
+            )
+
+            broad_local_residual_state = (
+                broad_local_residual_decomposer
+                .state_dict()
+            )
+
+        else:
+            training_scaled_residuals = (
+                prior_residual_transformer.transform(
+                    normalized_full_spectra[
+                        training_indices
+                    ]
+                )
+            )
+
+            spectra_for_model = (
+                prior_residual_transformer.transform(
+                    normalized_full_spectra
+                )
+            )
 
         print_prior_residual_summary(
             prior_residual_transformer,
-            training_scaled_residuals,
+            prior_summary_scaled_residuals,
+        )
+
+        print_broad_local_residual_summary(
+            broad_local_residual_decomposer,
+            (
+                training_scaled_residuals
+                if broad_local_enabled
+                else None
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1561,6 +1849,8 @@ def main() -> None:
     if (
         prior_residual_transformer
         is not None
+        and broad_local_residual_decomposer
+        is None
         and prior_residual_transformer.prior_method
         == "pca_reconstruction"
     ):
@@ -1910,6 +2200,9 @@ def main() -> None:
         "prior_residual_state": (
             prior_residual_state
         ),
+        "broad_local_residual_state": (
+            broad_local_residual_state
+        ),
         "physics_constraint_state": (
             physics_constraint_state
         ),
@@ -2062,6 +2355,26 @@ def main() -> None:
         print(
             "D2.4共同峰骨架保留比例："
             f"{prior_residual_transformer.blended_peak_component_ratio:g}"
+        )
+
+    if broad_local_residual_decomposer is not None:
+        broad_local_summary = (
+            broad_local_residual_decomposer.summary()
+        )
+
+        print(
+            "D2.6 broad-local residual：已启用"
+        )
+
+        print(
+            "D2.6 DDPM学习域：scaled local residual"
+        )
+
+        print(
+            "D2.6 broad sampler：train-only PCA；"
+            f"组件数={broad_local_summary['broad_pca_components']}；"
+            "累计解释方差="
+            f"{broad_local_summary['broad_pca_cumulative_explained_variance']:.6f}"
         )
 
     if not bool(
