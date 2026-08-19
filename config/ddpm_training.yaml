@@ -1,5 +1,5 @@
 project:
-  name: d3_3_tuned_jitter1p2_height0p90_d2_6_2000step_s001
+  name: d3_4_peak_parameter_physics_d2_6_2000step_s001
   random_seed: 2026
 diagnostic_overfit:
   enabled: false
@@ -111,6 +111,39 @@ relative_peak_intensity_constraints:
   maximum_total_ratio_to_ddpm: 0.05
   numerical_safety_limit: 12.0
   epsilon: 1.0e-08
+peak_parameter_constraints:
+  enabled: true
+  reference_baseline_sigma_cm1: 30.0
+  reference_peak_smoothing_sigma_cm1: 2.0
+  minimum_relative_prominence: 0.06
+  minimum_peak_distance_cm1: 12.0
+  maximum_peak_count: 10
+  minimum_peak_count: 3
+  edge_exclusion_cm1: 30.0
+  maximum_measurement_half_window_cm1: 18.0
+  minimum_measurement_half_window_cm1: 4.0
+  neighbor_window_fraction: 0.45
+  minimum_median_peak_height_fraction: 0.05
+  softplus_temperature_fraction: 0.05
+  minimum_softplus_temperature: 0.0001
+  lower_quantile: 10.0
+  upper_quantile: 90.0
+  position_margin_mad: 0.5
+  width_margin_mad: 0.5
+  minimum_position_half_range_cm1: 1.0
+  minimum_width_half_range_cm1: 1.0
+  position_scale_cm1: 1.0
+  width_scale_cm1: 2.0
+  position_loss_weight: 1.0
+  width_loss_weight: 0.5
+  smooth_l1_beta: 0.5
+  maximum_active_timestep_fraction: 0.5
+  timestep_weight_power: 1.0
+  minimum_timestep_weight: 0.0
+  total_weight: 0.1
+  maximum_total_ratio_to_ddpm: 0.02
+  numerical_safety_limit: 12.0
+  epsilon: 1.0e-08
 diversity_constraints:
   enabled: false
 feature_peak_residual_limiter:
@@ -162,11 +195,11 @@ training:
   maximum_validation_batches: 0
   validation_random_seed: 2026001
 output:
-  output_directory: outputs/experiments/d3_3_peak_jitter_height_compression_d2_6_2000step_s001
-  checkpoint_directory: outputs/experiments/d3_3_peak_jitter_height_compression_d2_6_2000step_s001/checkpoints
-  log_directory: outputs/experiments/d3_3_peak_jitter_height_compression_d2_6_2000step_s001/logs
-  generated_spectrum_directory: outputs/experiments/d3_3_tuned_jitter1p2_height0p90_d2_6_2000step_s001/generated/ddim50_ema_peak_jitter_height_compression
-  preview_plot_directory: outputs/experiments/d3_3_tuned_jitter1p2_height0p90_d2_6_2000step_s001/plots/ddim50_ema_peak_jitter_height_compression
+  output_directory: outputs/experiments/d3_4_peak_parameter_physics_d2_6_2000step_s001
+  checkpoint_directory: outputs/experiments/d3_4_peak_parameter_physics_d2_6_2000step_s001/checkpoints
+  log_directory: outputs/experiments/d3_4_peak_parameter_physics_d2_6_2000step_s001/logs
+  generated_spectrum_directory: outputs/experiments/d3_4_peak_parameter_physics_d2_6_2000step_s001/generated/ddim50_ema_no_sampling_calibration
+  preview_plot_directory: outputs/experiments/d3_4_peak_parameter_physics_d2_6_2000step_s001/plots/ddim50_ema_no_sampling_calibration
   latest_checkpoint_name: latest.pt
   best_checkpoint_name: best.pt
   training_log_name: training_log.csv
@@ -180,7 +213,7 @@ generation:
   variation_scale: 1.0
   pca_score_clip_override_standard_deviations: null
   sampling_calibration:
-    enabled: true
+    enabled: false
     non_peak_noise:
       enabled: false
       reference_smoothing_sigma_cm1: 30.0

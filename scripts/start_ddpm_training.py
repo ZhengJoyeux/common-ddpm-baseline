@@ -100,6 +100,9 @@ from src.sers_peak_derivative_constraints import (
 from src.sers_relative_peak_intensity_constraints import (
     fit_relative_peak_intensity_constraint_state,
 )
+from src.sers_peak_parameter_constraints import (
+    fit_peak_parameter_constraint_state,
+)
 from src.spectrum_dataset import (
     SpectrumDataset,
 )
@@ -130,6 +133,15 @@ def parse_arguments() -> argparse.Namespace:
         "--resume",
         default=None,
         help="从同一实验阶段checkpoint继续训练。",
+    )
+
+    parser.add_argument(
+        "--constraint-check-only",
+        action="store_true",
+        help=(
+            "只执行D3.4真实training batch约束激活和梯度检查，"
+            "不开始正式训练。"
+        ),
     )
 
     return parser.parse_args()
@@ -580,6 +592,10 @@ def validate_resume_stage(
         (
             "relative_peak_intensity_constraints",
             "D3.2自动峰区相对峰强约束",
+        ),
+        (
+            "peak_parameter_constraints",
+            "D3.4完整谱峰参数物理约束",
         ),
     )
 
@@ -1197,11 +1213,34 @@ def main() -> None:
         relative_peak_config.get("enabled", False)
     )
 
-    if peak_derivative_enabled and relative_peak_enabled:
+    peak_parameter_config = configuration.get(
+        "peak_parameter_constraints",
+        {"enabled": False},
+    ) or {"enabled": False}
+
+    if not isinstance(peak_parameter_config, dict):
+        raise TypeError(
+            "peak_parameter_constraints配置必须是字典。"
+        )
+
+    peak_parameter_enabled = bool(
+        peak_parameter_config.get("enabled", False)
+    )
+
+    enabled_new_d3_modules = sum(
+        int(value)
+        for value in (
+            peak_derivative_enabled,
+            relative_peak_enabled,
+            peak_parameter_enabled,
+        )
+    )
+
+    if enabled_new_d3_modules > 1:
         raise ValueError(
-            "D3消融每次只允许启用一个主要变量；"
-            "peak_derivative_constraints和"
-            "relative_peak_intensity_constraints不能同时启用。"
+            "D3消融每次只允许启用一个主要训练变量；"
+            "D3.1 peak_derivative、D3.2 relative_peak_intensity"
+            "和D3.4 peak_parameter不能同时启用。"
         )
 
     if peak_derivative_enabled and not broad_local_enabled:
@@ -1213,6 +1252,12 @@ def main() -> None:
     if relative_peak_enabled and not broad_local_enabled:
         raise ValueError(
             "D3.2自动峰区相对峰强约束要求启用"
+            "D2.6 broad_local_residual。"
+        )
+
+    if peak_parameter_enabled and not broad_local_enabled:
+        raise ValueError(
+            "D3.4完整谱峰参数物理约束要求启用"
             "D2.6 broad_local_residual。"
         )
 
@@ -1915,6 +1960,114 @@ def main() -> None:
         print("D3.2自动峰区相对峰强约束：未启用")
 
     # ------------------------------------------------------------------
+    # D3.4 train-only full-spectrum peak parameter constraints
+    # ------------------------------------------------------------------
+
+    peak_parameter_constraint_state = None
+
+    if peak_parameter_enabled:
+        if broad_local_residual_state is None:
+            raise RuntimeError(
+                "D3.4缺少D2.6 broad_local_residual_state。"
+            )
+
+        if constraint_reconstruction_bases_full is None:
+            raise RuntimeError(
+                "D3.4缺少outer PCA prior + true broad residual恢复基底。"
+            )
+
+        peak_parameter_constraint_state = (
+            fit_peak_parameter_constraint_state(
+                training_normalized_spectra=(
+                    normalized_full_spectra[
+                        training_indices
+                    ]
+                ),
+                raman_shift=np.asarray(
+                    length_adapter.model_raman_shift,
+                    dtype=np.float64,
+                ),
+                configuration=peak_parameter_config,
+            )
+        )
+
+        print(
+            "D3.4完整重建谱峰参数物理约束：已启用；"
+            "training-only自动稳定峰数="
+            f"{len(peak_parameter_constraint_state['detected_peak_centers_cm1'])}"
+        )
+
+        print(
+            "D3.4自动峰中心(cm^-1)：",
+            np.round(
+                np.asarray(
+                    peak_parameter_constraint_state[
+                        "detected_peak_centers_cm1"
+                    ],
+                    dtype=np.float64,
+                ),
+                3,
+            ).tolist(),
+        )
+
+        print(
+            "D3.4峰位下界：",
+            np.round(
+                np.asarray(
+                    peak_parameter_constraint_state[
+                        "position_lower_bound_cm1"
+                    ],
+                    dtype=np.float64,
+                ),
+                3,
+            ).tolist(),
+        )
+
+        print(
+            "D3.4峰位上界：",
+            np.round(
+                np.asarray(
+                    peak_parameter_constraint_state[
+                        "position_upper_bound_cm1"
+                    ],
+                    dtype=np.float64,
+                ),
+                3,
+            ).tolist(),
+        )
+
+        print(
+            "D3.4有效峰宽下界：",
+            np.round(
+                np.asarray(
+                    peak_parameter_constraint_state[
+                        "width_lower_bound_cm1"
+                    ],
+                    dtype=np.float64,
+                ),
+                3,
+            ).tolist(),
+        )
+
+        print(
+            "D3.4有效峰宽上界：",
+            np.round(
+                np.asarray(
+                    peak_parameter_constraint_state[
+                        "width_upper_bound_cm1"
+                    ],
+                    dtype=np.float64,
+                ),
+                3,
+            ).tolist(),
+        )
+
+    else:
+        print(
+            "D3.4完整重建谱峰参数物理约束：未启用"
+        )
+
+    # ------------------------------------------------------------------
     # D3 diversity
     # ------------------------------------------------------------------
 
@@ -2048,9 +2201,15 @@ def main() -> None:
             )
         )
 
-    if peak_derivative_enabled or relative_peak_enabled:
+    if (
+        peak_derivative_enabled
+        or relative_peak_enabled
+        or peak_parameter_enabled
+    ):
         if constraint_reconstruction_bases_full is None:
-            raise RuntimeError("D3.1/D3.2恢复基底尚未构建。")
+            raise RuntimeError(
+                "D3.1/D3.2/D3.4恢复基底尚未构建。"
+            )
         padded_constraint_reference_priors = length_adapter.adapt(
             constraint_reconstruction_bases_full
         )
@@ -2314,6 +2473,30 @@ def main() -> None:
             broad_local_residual_state=broad_local_residual_state,
         )
 
+    if peak_parameter_constraint_state is not None:
+        configure_peak_parameter = getattr(
+            diffusion,
+            "configure_peak_parameter_constraints",
+            None,
+        )
+
+        if not callable(
+            configure_peak_parameter
+        ):
+            raise RuntimeError(
+                "D3.4扩散模型缺少"
+                "configure_peak_parameter_constraints。"
+            )
+
+        configure_peak_parameter(
+            peak_parameter_constraint_state=(
+                peak_parameter_constraint_state
+            ),
+            broad_local_residual_state=(
+                broad_local_residual_state
+            ),
+        )
+
     if (
         diversity_constraint_state
         is not None
@@ -2337,6 +2520,641 @@ def main() -> None:
                 diversity_constraint_state
             ),
         )
+
+    # ------------------------------------------------------------------
+    # D3.4真实training batch约束激活/梯度检查
+    #
+    # 该检查：
+    # 1. 不读取training_loader，因此不会消耗正式shuffle顺序；
+    # 2. 不执行optimizer.step；
+    # 3. 不创建checkpoint/logger/trainer；
+    # 4. 只检查D3.4是否真正产生有限、非零梯度。
+    # ------------------------------------------------------------------
+
+    if arguments.constraint_check_only:
+        if not peak_parameter_enabled:
+            raise RuntimeError(
+                "--constraint-check-only要求"
+                "peak_parameter_constraints.enabled=true。"
+            )
+
+        if arguments.resume is not None:
+            raise RuntimeError(
+                "--constraint-check-only不允许同时使用--resume。"
+            )
+
+        if peak_parameter_constraint_state is None:
+            raise RuntimeError(
+                "D3.4 constraint state尚未配置。"
+            )
+
+        peak_parameter_loss_module = getattr(
+            diffusion,
+            "peak_parameter_loss_module",
+            None,
+        )
+
+        if peak_parameter_loss_module is None:
+            raise RuntimeError(
+                "扩散模型中没有D3.4 peak_parameter_loss_module。"
+            )
+
+        check_batch_size = min(
+            int(batch_size),
+            len(training_dataset),
+        )
+
+        if check_batch_size <= 0:
+            raise RuntimeError(
+                "D3.4自检没有可用training样本。"
+            )
+
+        check_items = [
+            training_dataset[index]
+            for index in range(check_batch_size)
+        ]
+
+        if not all(
+            isinstance(item, dict)
+            for item in check_items
+        ):
+            raise RuntimeError(
+                "D3.4自检要求SpectrumDataset返回"
+                "spectrum + constraint_reference_prior。"
+            )
+
+        if not all(
+            "spectrum" in item
+            and "constraint_reference_prior" in item
+            for item in check_items
+        ):
+            raise RuntimeError(
+                "D3.4自检batch缺少"
+                "spectrum或constraint_reference_prior。"
+            )
+
+        check_spectra = torch.stack(
+            [
+                item["spectrum"]
+                for item in check_items
+            ],
+            dim=0,
+        ).to(
+            device=device,
+            dtype=torch.float32,
+        )
+
+        check_reference_prior = torch.stack(
+            [
+                item["constraint_reference_prior"]
+                for item in check_items
+            ],
+            dim=0,
+        ).to(
+            device=device,
+            dtype=torch.float32,
+        )
+
+        diffusion = diffusion.to(
+            device
+        )
+
+        diffusion.train()
+
+        # ------------------------------------------------------
+        # 使用低至中噪声时间步。
+        #
+        # 不调用diffusion.forward()随机抽t，
+        # 避免刚好全部抽到D3.4关闭区域而形成假阴性。
+        # ------------------------------------------------------
+
+        maximum_active_fraction = float(
+            peak_parameter_config[
+                "maximum_active_timestep_fraction"
+            ]
+        )
+
+        maximum_active_timestep = int(
+            np.floor(
+                (
+                    int(diffusion.num_timesteps)
+                    - 1
+                )
+                * maximum_active_fraction
+            )
+        )
+
+        maximum_active_timestep = max(
+            0,
+            maximum_active_timestep,
+        )
+
+        if check_batch_size == 1:
+            check_timesteps = torch.zeros(
+                1,
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            check_timesteps = torch.linspace(
+                0,
+                maximum_active_timestep,
+                steps=check_batch_size,
+                device=device,
+            ).round().long()
+
+        # 自检使用独立随机状态。
+        # 因为检查完成后立即return，
+        # 不影响正式训练随机序列。
+        check_seed = int(
+            random_seed
+        ) + 3404
+
+        torch.manual_seed(
+            check_seed
+        )
+
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(
+                check_seed
+            )
+
+        check_noise = torch.randn_like(
+            check_spectra
+        )
+
+        diffusion.zero_grad(
+            set_to_none=True
+        )
+
+        check_total_loss = diffusion.p_losses(
+            check_spectra,
+            check_timesteps,
+            noise=check_noise,
+            constraint_reference_prior=(
+                check_reference_prior
+            ),
+        )
+
+        if not torch.isfinite(
+            check_total_loss
+        ):
+            raise RuntimeError(
+                "D3.4自检total loss出现NaN或无穷值。"
+            )
+
+        live_components = getattr(
+            diffusion,
+            "_latest_loss_components",
+            None,
+        )
+
+        if not isinstance(
+            live_components,
+            dict,
+        ):
+            raise RuntimeError(
+                "无法取得D3.4实时loss components。"
+            )
+
+        required_component_names = (
+            "ddpm_loss",
+            "peak_parameter_loss",
+            "peak_parameter_candidate_loss",
+            "peak_parameter_raw_loss",
+            "peak_parameter_position_loss",
+            "peak_parameter_width_loss",
+            "peak_parameter_loss_cap",
+            "peak_parameter_loss_scale",
+            "mean_peak_position_violation_cm1",
+            "mean_peak_width_violation_cm1",
+            "peak_position_violation_fraction",
+            "peak_width_violation_fraction",
+            "target_peak_position_violation_fraction",
+            "target_peak_width_violation_fraction",
+            "mean_peak_parameter_timestep_weight",
+        )
+
+        missing_components = [
+            name
+            for name in required_component_names
+            if name not in live_components
+        ]
+
+        if missing_components:
+            raise RuntimeError(
+                "D3.4自检缺少loss components："
+                f"{missing_components}"
+            )
+
+        live_ddpm_loss = (
+            live_components[
+                "ddpm_loss"
+            ]
+        )
+
+        live_peak_parameter_loss = (
+            live_components[
+                "peak_parameter_loss"
+            ]
+        )
+
+        if not live_ddpm_loss.requires_grad:
+            raise RuntimeError(
+                "DDPM loss没有梯度图。"
+            )
+
+        if not live_peak_parameter_loss.requires_grad:
+            raise RuntimeError(
+                "D3.4 loss没有梯度图。"
+            )
+
+        # ------------------------------------------------------
+        # 独立计算某个loss对U-Net参数的梯度norm。
+        #
+        # 这样不是只检查loss非零，
+        # 而是真正确认它能改变模型参数。
+        # ------------------------------------------------------
+
+        def calculate_model_gradient_norm(
+            loss: torch.Tensor,
+            *,
+            retain_graph: bool,
+        ) -> tuple[
+            float,
+            bool,
+            int,
+        ]:
+            diffusion.zero_grad(
+                set_to_none=True
+            )
+
+            loss.backward(
+                retain_graph=retain_graph
+            )
+
+            squared_norm = 0.0
+            all_finite = True
+            gradient_parameter_count = 0
+
+            for parameter in diffusion.model.parameters():
+                gradient = parameter.grad
+
+                if gradient is None:
+                    continue
+
+                gradient_parameter_count += 1
+
+                finite_here = bool(
+                    torch.isfinite(
+                        gradient
+                    ).all().item()
+                )
+
+                all_finite = (
+                    all_finite
+                    and finite_here
+                )
+
+                if finite_here:
+                    squared_norm += float(
+                        gradient
+                        .detach()
+                        .float()
+                        .square()
+                        .sum()
+                        .item()
+                    )
+
+            gradient_norm = (
+                squared_norm ** 0.5
+            )
+
+            return (
+                float(gradient_norm),
+                bool(all_finite),
+                int(
+                    gradient_parameter_count
+                ),
+            )
+
+        (
+            ddpm_gradient_norm,
+            ddpm_gradient_finite,
+            ddpm_gradient_parameter_count,
+        ) = calculate_model_gradient_norm(
+            live_ddpm_loss,
+            retain_graph=True,
+        )
+
+        (
+            peak_parameter_gradient_norm,
+            peak_parameter_gradient_finite,
+            peak_parameter_gradient_parameter_count,
+        ) = calculate_model_gradient_norm(
+            live_peak_parameter_loss,
+            retain_graph=False,
+        )
+
+        diffusion.zero_grad(
+            set_to_none=True
+        )
+
+        def scalar(
+            name: str,
+        ) -> float:
+            return float(
+                live_components[
+                    name
+                ]
+                .detach()
+                .float()
+                .item()
+            )
+
+        ddpm_value = scalar(
+            "ddpm_loss"
+        )
+
+        peak_parameter_value = scalar(
+            "peak_parameter_loss"
+        )
+
+        peak_parameter_candidate = scalar(
+            "peak_parameter_candidate_loss"
+        )
+
+        peak_parameter_raw = scalar(
+            "peak_parameter_raw_loss"
+        )
+
+        epsilon = 1.0e-12
+
+        candidate_to_ddpm_ratio = (
+            peak_parameter_candidate
+            / max(
+                abs(ddpm_value),
+                epsilon,
+            )
+        )
+
+        actual_to_ddpm_ratio = (
+            peak_parameter_value
+            / max(
+                abs(ddpm_value),
+                epsilon,
+            )
+        )
+
+        gradient_norm_ratio = (
+            peak_parameter_gradient_norm
+            / max(
+                ddpm_gradient_norm,
+                epsilon,
+            )
+        )
+
+        detected_peak_count = len(
+            peak_parameter_constraint_state[
+                "detected_peak_centers_cm1"
+            ]
+        )
+
+        print()
+        print(
+            "===== D3.4 constraint activation check ====="
+        )
+
+        print(
+            "检查用途：真实training batch，"
+            "不执行optimizer.step，不开始正式训练"
+        )
+
+        print(
+            "check batch size：",
+            check_batch_size,
+        )
+
+        print(
+            "check timesteps：",
+            check_timesteps
+            .detach()
+            .cpu()
+            .tolist(),
+        )
+
+        print(
+            "detected peak count：",
+            detected_peak_count,
+        )
+
+        print(
+            "ddpm loss：",
+            f"{ddpm_value:.8e}",
+        )
+
+        print(
+            "peak parameter raw loss：",
+            f"{peak_parameter_raw:.8e}",
+        )
+
+        print(
+            "position loss：",
+            f"{scalar('peak_parameter_position_loss'):.8e}",
+        )
+
+        print(
+            "width loss：",
+            f"{scalar('peak_parameter_width_loss'):.8e}",
+        )
+
+        print(
+            "candidate loss：",
+            f"{peak_parameter_candidate:.8e}",
+        )
+
+        print(
+            "actual capped D3.4 loss：",
+            f"{peak_parameter_value:.8e}",
+        )
+
+        print(
+            "loss cap：",
+            f"{scalar('peak_parameter_loss_cap'):.8e}",
+        )
+
+        print(
+            "loss scale：",
+            f"{scalar('peak_parameter_loss_scale'):.8e}",
+        )
+
+        print(
+            "candidate / DDPM：",
+            f"{candidate_to_ddpm_ratio:.8e}",
+        )
+
+        print(
+            "actual D3.4 / DDPM：",
+            f"{actual_to_ddpm_ratio:.8e}",
+        )
+
+        print(
+            "mean position violation (cm^-1)：",
+            f"{scalar('mean_peak_position_violation_cm1'):.8e}",
+        )
+
+        print(
+            "mean width violation (cm^-1)：",
+            f"{scalar('mean_peak_width_violation_cm1'):.8e}",
+        )
+
+        print(
+            "position violation fraction：",
+            f"{scalar('peak_position_violation_fraction'):.8e}",
+        )
+
+        print(
+            "width violation fraction：",
+            f"{scalar('peak_width_violation_fraction'):.8e}",
+        )
+
+        print(
+            "target position violation fraction：",
+            f"{scalar('target_peak_position_violation_fraction'):.8e}",
+        )
+
+        print(
+            "target width violation fraction：",
+            f"{scalar('target_peak_width_violation_fraction'):.8e}",
+        )
+
+        print(
+            "mean timestep weight：",
+            f"{scalar('mean_peak_parameter_timestep_weight'):.8e}",
+        )
+
+        print(
+            "DDPM gradient norm：",
+            f"{ddpm_gradient_norm:.8e}",
+        )
+
+        print(
+            "D3.4 gradient norm：",
+            f"{peak_parameter_gradient_norm:.8e}",
+        )
+
+        print(
+            "D3.4/DDPM gradient norm ratio：",
+            f"{gradient_norm_ratio:.8e}",
+        )
+
+        print(
+            "DDPM gradient finite：",
+            ddpm_gradient_finite,
+        )
+
+        print(
+            "D3.4 gradient finite：",
+            peak_parameter_gradient_finite,
+        )
+
+        print(
+            "DDPM gradient parameter count：",
+            ddpm_gradient_parameter_count,
+        )
+
+        print(
+            "D3.4 gradient parameter count：",
+            peak_parameter_gradient_parameter_count,
+        )
+
+        print(
+            "D3.4 gradient nonzero：",
+            peak_parameter_gradient_norm
+            > epsilon,
+        )
+
+        print(
+            "============================================"
+        )
+        print()
+
+        failures = []
+
+        if not ddpm_gradient_finite:
+            failures.append(
+                "DDPM梯度存在NaN/Inf"
+            )
+
+        if not peak_parameter_gradient_finite:
+            failures.append(
+                "D3.4梯度存在NaN/Inf"
+            )
+
+        if ddpm_gradient_norm <= epsilon:
+            failures.append(
+                "DDPM梯度norm接近0"
+            )
+
+        if peak_parameter_raw <= epsilon:
+            failures.append(
+                "D3.4 raw loss接近0，"
+                "真实模型输出未激活物理约束"
+            )
+
+        if peak_parameter_value <= epsilon:
+            failures.append(
+                "实际加入total loss的D3.4 loss接近0"
+            )
+
+        if peak_parameter_gradient_norm <= epsilon:
+            failures.append(
+                "D3.4对U-Net的梯度norm接近0"
+            )
+
+        configured_maximum_ratio = float(
+            peak_parameter_config[
+                "maximum_total_ratio_to_ddpm"
+            ]
+        )
+
+        if (
+            actual_to_ddpm_ratio
+            >
+            configured_maximum_ratio
+            + 1.0e-6
+        ):
+            failures.append(
+                "D3.4实际loss超过配置的DDPM占比上限"
+            )
+
+        if failures:
+            print(
+                "D3.4约束激活检查：未通过"
+            )
+
+            for failure in failures:
+                print(
+                    " -",
+                    failure,
+                )
+
+            raise RuntimeError(
+                "D3.4 constraint activation check失败；"
+                "不要开始2000-step正式训练。"
+            )
+
+        print(
+            "D3.4约束激活检查：通过"
+        )
+
+        print(
+            "注意：通过只代表约束真实参与反向传播，"
+            "不代表模型最终生成质量已经改善。"
+        )
+
+        return
+
 
     # ------------------------------------------------------------------
     # checkpoint / metadata
@@ -2435,6 +3253,9 @@ def main() -> None:
         ),
         "relative_peak_intensity_constraint_state": (
             relative_peak_intensity_constraint_state
+        ),
+        "peak_parameter_constraint_state": (
+            peak_parameter_constraint_state
         ),
         "diversity_constraint_state": (
             diversity_constraint_state

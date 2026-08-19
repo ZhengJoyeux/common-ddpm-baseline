@@ -36,6 +36,10 @@ from src.sers_relative_peak_intensity_constraints import (
     DifferentiableRelativePeakIntensityLoss,
     normalize_relative_peak_intensity_configuration,
 )
+from src.sers_peak_parameter_constraints import (
+    DifferentiablePeakParameterLoss,
+    normalize_peak_parameter_configuration,
+)
 
 
 T = TypeVar("T")
@@ -150,6 +154,7 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         local_peak_distribution_configuration: dict[str, Any] | None = None,
         peak_derivative_configuration: dict[str, Any] | None = None,
         relative_peak_intensity_configuration: dict[str, Any] | None = None,
+        peak_parameter_configuration: dict[str, Any] | None = None,
         residual_aware_configuration: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
@@ -177,6 +182,11 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
                 relative_peak_intensity_configuration or {"enabled": False}
             )
         )
+        self.peak_parameter_configuration = (
+            normalize_peak_parameter_configuration(
+                peak_parameter_configuration or {"enabled": False}
+            )
+        )
         self.residual_aware_configuration = (
             _normalize_residual_aware_configuration(
                 residual_aware_configuration or {"enabled": False}
@@ -198,6 +208,9 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         self.relative_peak_intensity_enabled = bool(
             self.relative_peak_intensity_configuration.get("enabled", False)
         )
+        self.peak_parameter_enabled = bool(
+            self.peak_parameter_configuration.get("enabled", False)
+        )
         self.residual_aware_enabled = bool(
             self.residual_aware_configuration.get("enabled", False)
         )
@@ -209,14 +222,15 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
                 self.local_peak_distribution_enabled,
                 self.peak_derivative_enabled,
                 self.relative_peak_intensity_enabled,
+                self.peak_parameter_enabled,
                 self.residual_aware_enabled,
             )
         ):
             raise ValueError(
                 "SersPhysicsGuidedGaussianDiffusion1D至少需要启用"
                 "physics、diversity、local_peak_distribution、"
-                "peak_derivative、relative_peak_intensity或"
-                "residual_aware之一。"
+                "peak_derivative、relative_peak_intensity、"
+                "peak_parameter或residual_aware之一。"
             )
 
         if self.objective != "pred_x0":
@@ -257,6 +271,9 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         ) = None
         self.relative_peak_intensity_loss_module: (
             DifferentiableRelativePeakIntensityLoss | None
+        ) = None
+        self.peak_parameter_loss_module: (
+            DifferentiablePeakParameterLoss | None
         ) = None
 
         self._latest_loss_components: dict[str, torch.Tensor] = {}
@@ -366,6 +383,29 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
                     relative_peak_intensity_constraint_state
                 ),
                 broad_local_residual_state=broad_local_residual_state,
+                padded_length=self.seq_length,
+            )
+        )
+
+    def configure_peak_parameter_constraints(
+        self,
+        *,
+        peak_parameter_constraint_state: dict[str, Any],
+        broad_local_residual_state: dict[str, Any],
+    ) -> None:
+        """配置D3.4完整重建谱峰参数训练物理约束。"""
+
+        if not self.peak_parameter_enabled:
+            return
+
+        self.peak_parameter_loss_module = (
+            DifferentiablePeakParameterLoss(
+                peak_parameter_constraint_state=(
+                    peak_parameter_constraint_state
+                ),
+                broad_local_residual_state=(
+                    broad_local_residual_state
+                ),
                 padded_length=self.seq_length,
             )
         )
@@ -675,6 +715,74 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
             relative_peak_loss_scale = zero
             weighted_relative_peak_loss = zero
 
+        if self.peak_parameter_enabled:
+            if self.peak_parameter_loss_module is None:
+                raise RuntimeError(
+                    "D3.4扩散模型尚未配置peak parameter state。"
+                )
+
+            peak_parameter = self.peak_parameter_loss_module(
+                predicted_scaled_local_residual=model_out,
+                target_scaled_local_residual=x_start,
+                reconstruction_base=constraint_reference_prior,
+                timesteps=t,
+                alphas_cumprod=self.alphas_cumprod,
+            )
+
+            peak_parameter_candidate = (
+                float(
+                    self.peak_parameter_configuration[
+                        "total_weight"
+                    ]
+                )
+                * peak_parameter[
+                    "peak_parameter_timestep_weighted_loss"
+                ]
+            )
+
+            peak_parameter_loss_cap = (
+                ddpm_loss.detach()
+                * float(
+                    self.peak_parameter_configuration[
+                        "maximum_total_ratio_to_ddpm"
+                    ]
+                )
+            )
+
+            if (
+                float(
+                    peak_parameter_candidate
+                    .detach()
+                    .abs()
+                    .item()
+                )
+                <= 1.0e-12
+            ):
+                peak_parameter_loss_scale = (
+                    peak_parameter_candidate.new_tensor(1.0)
+                )
+            else:
+                peak_parameter_loss_scale = torch.clamp(
+                    peak_parameter_loss_cap
+                    / peak_parameter_candidate
+                    .detach()
+                    .abs()
+                    .clamp_min(1.0e-12),
+                    max=1.0,
+                )
+
+            weighted_peak_parameter_loss = (
+                peak_parameter_candidate
+                * peak_parameter_loss_scale
+            )
+
+        else:
+            peak_parameter = {}
+            peak_parameter_candidate = zero
+            peak_parameter_loss_cap = zero
+            peak_parameter_loss_scale = zero
+            weighted_peak_parameter_loss = zero
+
         total_loss = (
             ddpm_loss
             + weighted_physics_loss
@@ -682,6 +790,7 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
             + weighted_local_peak_loss
             + weighted_peak_derivative_loss
             + weighted_relative_peak_loss
+            + weighted_peak_parameter_loss
         )
 
         self._latest_loss_components = {
@@ -859,6 +968,47 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
             ),
             "mean_relative_peak_height": relative_peak.get(
                 "mean_relative_peak_height", zero
+            ),
+
+            "peak_parameter_loss": weighted_peak_parameter_loss,
+            "peak_parameter_candidate_loss": peak_parameter_candidate,
+            "peak_parameter_raw_loss": peak_parameter.get(
+                "peak_parameter_raw_loss", zero
+            ),
+            "peak_parameter_position_loss": peak_parameter.get(
+                "peak_parameter_position_loss", zero
+            ),
+            "peak_parameter_width_loss": peak_parameter.get(
+                "peak_parameter_width_loss", zero
+            ),
+            "peak_parameter_loss_cap": peak_parameter_loss_cap,
+            "peak_parameter_loss_scale": peak_parameter_loss_scale,
+            "mean_peak_position_violation_cm1": peak_parameter.get(
+                "mean_peak_position_violation_cm1", zero
+            ),
+            "mean_peak_width_violation_cm1": peak_parameter.get(
+                "mean_peak_width_violation_cm1", zero
+            ),
+            "peak_position_violation_fraction": peak_parameter.get(
+                "peak_position_violation_fraction", zero
+            ),
+            "peak_width_violation_fraction": peak_parameter.get(
+                "peak_width_violation_fraction", zero
+            ),
+            "target_peak_position_violation_fraction": peak_parameter.get(
+                "target_peak_position_violation_fraction", zero
+            ),
+            "target_peak_width_violation_fraction": peak_parameter.get(
+                "target_peak_width_violation_fraction", zero
+            ),
+            "mean_peak_parameter_timestep_weight": peak_parameter.get(
+                "mean_peak_parameter_timestep_weight", zero
+            ),
+            "mean_predicted_peak_position_cm1": peak_parameter.get(
+                "mean_predicted_peak_position_cm1", zero
+            ),
+            "mean_predicted_effective_width_cm1": peak_parameter.get(
+                "mean_predicted_effective_width_cm1", zero
             ),
         }
 

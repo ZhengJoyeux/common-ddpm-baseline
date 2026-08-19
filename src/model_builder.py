@@ -27,6 +27,9 @@ from src.sers_peak_derivative_constraints import (
 from src.sers_relative_peak_intensity_constraints import (
     normalize_relative_peak_intensity_configuration,
 )
+from src.sers_peak_parameter_constraints import (
+    normalize_peak_parameter_configuration,
+)
 
 
 def _get_required_value(
@@ -99,6 +102,10 @@ def build_diffusion_model(
     relative_peak_raw = _as_optional_dictionary(
         model_configuration.get("relative_peak_intensity_constraints", {}),
         name="relative_peak_intensity_constraints",
+    )
+    peak_parameter_raw = _as_optional_dictionary(
+        model_configuration.get("peak_parameter_constraints", {}),
+        name="peak_parameter_constraints",
     )
     prior_config = _as_optional_dictionary(
         model_configuration.get("prior_residual", {}),
@@ -218,6 +225,9 @@ def build_diffusion_model(
     relative_peak_config = normalize_relative_peak_intensity_configuration(
         relative_peak_raw
     )
+    peak_parameter_config = normalize_peak_parameter_configuration(
+        peak_parameter_raw
+    )
 
     physics_enabled = bool(physics_config.get("enabled", False))
     diversity_enabled = bool(diversity_config.get("enabled", False))
@@ -227,6 +237,9 @@ def build_diffusion_model(
     )
     relative_peak_enabled = bool(
         relative_peak_config.get("enabled", False)
+    )
+    peak_parameter_enabled = bool(
+        peak_parameter_config.get("enabled", False)
     )
     residual_aware_enabled = bool(
         residual_aware_raw.get("enabled", False)
@@ -239,6 +252,7 @@ def build_diffusion_model(
             local_peak_enabled,
             peak_derivative_enabled,
             relative_peak_enabled,
+            peak_parameter_enabled,
             residual_aware_enabled,
         )
     )
@@ -268,10 +282,14 @@ def build_diffusion_model(
                 "pointwise_mad_asinh。"
             )
 
-    if peak_derivative_enabled or relative_peak_enabled:
+    if (
+        peak_derivative_enabled
+        or relative_peak_enabled
+        or peak_parameter_enabled
+    ):
         if not bool(prior_config.get("enabled", False)):
             raise ValueError(
-                "peak_derivative/relative_peak_intensity约束要求"
+                "peak_derivative/relative_peak_intensity/peak_parameter约束要求"
                 "启用prior_residual。"
             )
         broad_local_config = _as_optional_dictionary(
@@ -280,7 +298,7 @@ def build_diffusion_model(
         )
         if not bool(broad_local_config.get("enabled", False)):
             raise ValueError(
-                "peak_derivative/relative_peak_intensity约束要求启用"
+                "peak_derivative/relative_peak_intensity/peak_parameter约束要求启用"
                 "D2.6 broad_local_residual。"
             )
         local_normalization = _as_optional_dictionary(
@@ -291,7 +309,7 @@ def build_diffusion_model(
             "robust_asinh"
         ):
             raise ValueError(
-                "peak_derivative/relative_peak_intensity约束当前要求"
+                "peak_derivative/relative_peak_intensity/peak_parameter约束当前要求"
                 "broad_local_residual.local_normalization.method="
                 "robust_asinh。"
             )
@@ -317,6 +335,7 @@ def build_diffusion_model(
             local_peak_distribution_configuration=local_peak_config,
             peak_derivative_configuration=peak_derivative_config,
             relative_peak_intensity_configuration=relative_peak_config,
+            peak_parameter_configuration=peak_parameter_config,
             residual_aware_configuration=residual_aware_raw,
             **common_arguments,
         )
@@ -338,6 +357,9 @@ def build_diffusion_model(
     )
     diffusion_model.configured_relative_peak_intensity_enabled = (
         relative_peak_enabled
+    )
+    diffusion_model.configured_peak_parameter_enabled = (
+        peak_parameter_enabled
     )
     diffusion_model.configured_residual_aware_enabled = (
         residual_aware_enabled

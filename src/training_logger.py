@@ -86,6 +86,22 @@ COMPONENT_FIELDS = (
     "mean_relative_peak_intensity_boundary_error",
     "mean_relative_peak_intensity_target_error",
     "mean_relative_peak_height",
+    "peak_parameter_loss",
+    "peak_parameter_candidate_loss",
+    "peak_parameter_raw_loss",
+    "peak_parameter_position_loss",
+    "peak_parameter_width_loss",
+    "peak_parameter_loss_cap",
+    "peak_parameter_loss_scale",
+    "mean_peak_position_violation_cm1",
+    "mean_peak_width_violation_cm1",
+    "peak_position_violation_fraction",
+    "peak_width_violation_fraction",
+    "target_peak_position_violation_fraction",
+    "target_peak_width_violation_fraction",
+    "mean_peak_parameter_timestep_weight",
+    "mean_predicted_peak_position_cm1",
+    "mean_predicted_effective_width_cm1",
 )
 
 
@@ -244,6 +260,18 @@ class TrainingLogger:
             relative_peak_error_text = (
                 f"{training_components.get('mean_relative_peak_intensity_boundary_error', 0.0):.4f}"
             )
+            peak_parameter_text = (
+                f"{training_components.get('peak_parameter_loss', 0.0):.6f}"
+            )
+            peak_parameter_scale_text = (
+                f"{training_components.get('peak_parameter_loss_scale', 0.0):.3f}"
+            )
+            peak_position_violation_text = (
+                f"{training_components.get('mean_peak_position_violation_cm1', 0.0):.4f}"
+            )
+            peak_width_violation_text = (
+                f"{training_components.get('mean_peak_width_violation_cm1', 0.0):.4f}"
+            )
 
             extra_text = (
                 f" | ddpm_uniform={uniform_text}"
@@ -261,6 +289,10 @@ class TrainingLogger:
                 f" | rel_peak={relative_peak_text}"
                 f" | rel_peak_scale={relative_peak_scale_text}"
                 f" | rel_peak_err={relative_peak_error_text}"
+                f" | peak_param={peak_parameter_text}"
+                f" | peak_param_scale={peak_parameter_scale_text}"
+                f" | peak_pos_v={peak_position_violation_text}"
+                f" | peak_width_v={peak_width_violation_text}"
             )
         else:
             ddpm_text = "未记录"
