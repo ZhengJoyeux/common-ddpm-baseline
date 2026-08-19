@@ -68,6 +68,24 @@ COMPONENT_FIELDS = (
     "local_peak_active_samples",
     "local_peak_count",
     "mean_local_peak_timestep_weight",
+    "peak_derivative_loss",
+    "peak_derivative_candidate_loss",
+    "peak_derivative_raw_loss",
+    "peak_derivative_timestep_weighted_loss",
+    "peak_derivative_loss_cap",
+    "peak_derivative_loss_scale",
+    "mean_peak_derivative_timestep_weight",
+    "mean_peak_derivative_absolute_error",
+    "relative_peak_intensity_loss",
+    "relative_peak_intensity_candidate_loss",
+    "relative_peak_intensity_boundary_loss",
+    "relative_peak_intensity_target_loss",
+    "relative_peak_intensity_loss_cap",
+    "relative_peak_intensity_loss_scale",
+    "mean_relative_peak_intensity_timestep_weight",
+    "mean_relative_peak_intensity_boundary_error",
+    "mean_relative_peak_intensity_target_error",
+    "mean_relative_peak_height",
 )
 
 
@@ -100,7 +118,7 @@ class TrainingLogger:
             if tuple(existing_header) != tuple(self.FIELD_NAMES):
                 raise RuntimeError(
                     "现有训练日志表头与当前日志格式不一致。"
-                    "本次局部峰分布约束增加了新的日志字段；"
+                    "当前D3模块增加了新的日志字段；"
                     "请使用新的output目录，不要覆盖旧实验日志。"
                 )
         else:
@@ -211,6 +229,21 @@ class TrainingLogger:
             active_text = (
                 f"{training_components.get('local_peak_active_samples', 0.0):.1f}"
             )
+            peak_derivative_text = (
+                f"{training_components.get('peak_derivative_loss', 0.0):.6f}"
+            )
+            peak_derivative_scale_text = (
+                f"{training_components.get('peak_derivative_loss_scale', 0.0):.3f}"
+            )
+            relative_peak_text = (
+                f"{training_components.get('relative_peak_intensity_loss', 0.0):.6f}"
+            )
+            relative_peak_scale_text = (
+                f"{training_components.get('relative_peak_intensity_loss_scale', 0.0):.3f}"
+            )
+            relative_peak_error_text = (
+                f"{training_components.get('mean_relative_peak_intensity_boundary_error', 0.0):.4f}"
+            )
 
             extra_text = (
                 f" | ddpm_uniform={uniform_text}"
@@ -223,6 +256,11 @@ class TrainingLogger:
                 f" | width_disp={width_text}"
                 f" | height_cv={height_text}"
                 f" | local_n={active_text}"
+                f" | peak_d1={peak_derivative_text}"
+                f" | peak_d1_scale={peak_derivative_scale_text}"
+                f" | rel_peak={relative_peak_text}"
+                f" | rel_peak_scale={relative_peak_scale_text}"
+                f" | rel_peak_err={relative_peak_error_text}"
             )
         else:
             ddpm_text = "未记录"

@@ -1012,6 +1012,75 @@ def test_sampling_calibration_adds_coherent_bounded_peak_shift():
     )
 
 
+def test_sampling_calibration_compresses_peak_height_variation_and_skips_weak_peaks():
+    """验证自动主峰峰高离散度被压缩，弱峰/肩峰不参与压缩。"""
+
+    axis, _ = _sampling_calibration_reference()
+    strong_one = np.exp(-0.5 * ((axis - 660.0) / 4.0) ** 2)
+    strong_two = 0.8 * np.exp(-0.5 * ((axis - 742.0) / 5.0) ** 2)
+    weak_shoulder = 0.03 * np.exp(-0.5 * ((axis - 700.0) / 3.0) ** 2)
+    reference = (0.1 + strong_one + strong_two + weak_shoulder).astype(
+        np.float32
+    )
+    amplitudes = np.linspace(0.55, 1.65, 40)
+    spectra = np.stack(
+        [
+            0.1
+            + amplitude * strong_one
+            + (1.15 - 0.35 * amplitude) * strong_two
+            + weak_shoulder
+            for amplitude in amplitudes
+        ]
+    ).astype(np.float32)
+    configuration = {
+        "enabled": True,
+        "non_peak_noise": {"enabled": False},
+        "raman_shift_jitter": {"enabled": False},
+        "peak_height_compression": {
+            "enabled": True,
+            "reference_smoothing_sigma_cm1": 24.0,
+            "reference_peak_smoothing_sigma_cm1": 1.5,
+            "minimum_relative_prominence": 0.02,
+            "minimum_peak_distance_cm1": 20.0,
+            "maximum_peak_count": 4,
+            "peak_half_width_cm1": 8.0,
+            "transition_width_cm1": 3.0,
+            "height_variation_scale": 0.50,
+            "minimum_batch_peak_median_height_fraction": 0.08,
+            "minimum_valid_height": 1.0e-8,
+            "minimum_factor": 0.40,
+            "maximum_factor": 1.80,
+        },
+    }
+    calibrator = SersSamplingCalibrator(
+        raman_shift=axis,
+        reference_spectrum=reference,
+        configuration=configuration,
+        random_seed=2026,
+    )
+    calibrated = calibrator.apply(spectra)
+    summary = calibrator.summary()
+
+    assert summary["peak_height_compression_enabled"]
+    assert summary["height_compression_peak_count"] >= 2
+    assert summary["height_compression_active_peak_count"] == 2
+    assert summary["height_cv_after"] < 0.75 * summary["height_cv_before"]
+
+    for center in (660.0, 742.0):
+        window = np.abs(axis - center) <= 8.0
+        before_heights = np.max(spectra[:, window] - 0.1, axis=1)
+        after_heights = np.max(calibrated[:, window] - 0.1, axis=1)
+        assert np.std(after_heights) < 0.75 * np.std(before_heights)
+
+    weak_window = np.abs(axis - 700.0) <= 5.0
+    np.testing.assert_allclose(
+        calibrated[:, weak_window],
+        spectra[:, weak_window],
+        rtol=0.0,
+        atol=2.0e-2,
+    )
+
+
 def test_pca_score_clip_runtime_override_uses_cli_and_preserves_checkpoint_state():
     # CLI只修改恢复后的内存transformer，不修改原checkpoint state。
 

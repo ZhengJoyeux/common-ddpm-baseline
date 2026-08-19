@@ -94,6 +94,12 @@ from src.sers_diversity_constraints import (
 from src.sers_physics_constraints import (
     fit_sers_physics_constraint_state,
 )
+from src.sers_peak_derivative_constraints import (
+    fit_peak_derivative_constraint_state,
+)
+from src.sers_relative_peak_intensity_constraints import (
+    fit_relative_peak_intensity_constraint_state,
+)
 from src.spectrum_dataset import (
     SpectrumDataset,
 )
@@ -567,6 +573,14 @@ def validate_resume_stage(
             "local_peak_distribution_constraints",
             "D3局部峰分布约束",
         ),
+        (
+            "peak_derivative_constraints",
+            "D3.1自动峰区一阶导数约束",
+        ),
+        (
+            "relative_peak_intensity_constraints",
+            "D3.2自动峰区相对峰强约束",
+        ),
     )
 
     for (
@@ -1002,6 +1016,8 @@ def print_broad_local_residual_summary(
 
 def print_physics_summary(
     state: dict | None,
+    peak_derivative_enabled: bool,
+    relative_peak_intensity_enabled: bool,
 ) -> None:
     if (
         not state
@@ -1013,7 +1029,21 @@ def print_physics_summary(
         )
     ):
         print(
-            "D3物理/峰约束：未启用"
+            "旧D3复合物理/峰约束：未启用"
+        )
+
+    if peak_derivative_enabled:
+        print(
+            "D3.1唯一新增变量：train-only自动峰区"
+            "一阶导数软约束"
+        )
+
+        return
+
+    if relative_peak_intensity_enabled:
+        print(
+            "D3.2唯一新增变量：train-only自动峰区"
+            "相对峰强软约束"
         )
 
         return
@@ -1133,6 +1163,59 @@ def main() -> None:
         },
     )
 
+    peak_derivative_config = configuration.get(
+        "peak_derivative_constraints",
+        {
+            "enabled": False,
+        },
+    ) or {
+        "enabled": False,
+    }
+
+    if not isinstance(peak_derivative_config, dict):
+        raise TypeError("peak_derivative_constraints配置必须是字典。")
+
+    peak_derivative_enabled = bool(
+        peak_derivative_config.get("enabled", False)
+    )
+
+    relative_peak_config = configuration.get(
+        "relative_peak_intensity_constraints",
+        {
+            "enabled": False,
+        },
+    ) or {
+        "enabled": False,
+    }
+
+    if not isinstance(relative_peak_config, dict):
+        raise TypeError(
+            "relative_peak_intensity_constraints配置必须是字典。"
+        )
+
+    relative_peak_enabled = bool(
+        relative_peak_config.get("enabled", False)
+    )
+
+    if peak_derivative_enabled and relative_peak_enabled:
+        raise ValueError(
+            "D3消融每次只允许启用一个主要变量；"
+            "peak_derivative_constraints和"
+            "relative_peak_intensity_constraints不能同时启用。"
+        )
+
+    if peak_derivative_enabled and not broad_local_enabled:
+        raise ValueError(
+            "D3.1自动峰区一阶导数约束要求启用"
+            "D2.6 broad_local_residual。"
+        )
+
+    if relative_peak_enabled and not broad_local_enabled:
+        raise ValueError(
+            "D3.2自动峰区相对峰强约束要求启用"
+            "D2.6 broad_local_residual。"
+        )
+
     if broad_local_enabled:
         if not bool(
             prior_config.get(
@@ -1191,7 +1274,8 @@ def main() -> None:
 
         if enabled_incompatible:
             raise ValueError(
-                "D2.6第一轮消融要求关闭全部D3模块；"
+                "D3.1消融只允许启用自动峰区一阶导数约束；"
+                "其余旧D3模块必须关闭；"
                 "当前仍启用："
                 f"{enabled_incompatible}。"
             )
@@ -1443,6 +1527,8 @@ def main() -> None:
 
     broad_local_residual_state = None
 
+    constraint_reconstruction_bases_full = None
+
     spectra_for_model = (
         normalized_full_spectra.copy()
     )
@@ -1644,6 +1730,19 @@ def main() -> None:
                 ),
             )
 
+            broad_residuals_full, _ = (
+                broad_local_residual_decomposer.split_raw_residuals(
+                    raw_residuals_full
+                )
+            )
+
+            constraint_reconstruction_bases_full = (
+                reference_priors_full + broad_residuals_full
+            ).astype(
+                np.float32,
+                copy=False,
+            )
+
             training_scaled_residuals = (
                 broad_local_residual_decomposer
                 .transform_raw_residuals(
@@ -1730,8 +1829,90 @@ def main() -> None:
         )
 
     print_physics_summary(
-        physics_constraint_state
+        physics_constraint_state,
+        peak_derivative_enabled=peak_derivative_enabled,
+        relative_peak_intensity_enabled=relative_peak_enabled,
     )
+
+    # ------------------------------------------------------------------
+    # D3.1 train-only automatic peak derivative constraint
+    # ------------------------------------------------------------------
+
+    peak_derivative_constraint_state = None
+
+    if peak_derivative_enabled:
+        if broad_local_residual_state is None:
+            raise RuntimeError(
+                "D3.1缺少D2.6 broad_local_residual_state。"
+            )
+        if constraint_reconstruction_bases_full is None:
+            raise RuntimeError(
+                "D3.1缺少outer PCA prior + broad residual恢复基底。"
+            )
+
+        peak_derivative_constraint_state = (
+            fit_peak_derivative_constraint_state(
+                training_normalized_spectra=(
+                    normalized_full_spectra[training_indices]
+                ),
+                raman_shift=np.asarray(
+                    length_adapter.model_raman_shift,
+                    dtype=np.float64,
+                ),
+                configuration=peak_derivative_config,
+            )
+        )
+
+        print(
+            "D3.1自动峰区一阶导数约束：已启用；"
+            "训练集自动峰数="
+            f"{len(peak_derivative_constraint_state['detected_peak_indices'])}；"
+            "峰区mask占比="
+            f"{100.0 * float(peak_derivative_constraint_state['peak_mask_fraction']):.2f}%；"
+            "导数尺度="
+            f"{float(peak_derivative_constraint_state['derivative_scale']):.8g}"
+        )
+    else:
+        print("D3.1自动峰区一阶导数约束：未启用")
+
+    # ------------------------------------------------------------------
+    # D3.2 train-only automatic relative peak intensity constraint
+    # ------------------------------------------------------------------
+
+    relative_peak_intensity_constraint_state = None
+
+    if relative_peak_enabled:
+        if broad_local_residual_state is None:
+            raise RuntimeError(
+                "D3.2缺少D2.6 broad_local_residual_state。"
+            )
+        if constraint_reconstruction_bases_full is None:
+            raise RuntimeError(
+                "D3.2缺少outer PCA prior + broad residual恢复基底。"
+            )
+
+        relative_peak_intensity_constraint_state = (
+            fit_relative_peak_intensity_constraint_state(
+                training_normalized_spectra=(
+                    normalized_full_spectra[training_indices]
+                ),
+                raman_shift=np.asarray(
+                    length_adapter.model_raman_shift,
+                    dtype=np.float64,
+                ),
+                configuration=relative_peak_config,
+            )
+        )
+
+        print(
+            "D3.2自动峰区相对峰强约束：已启用；"
+            "训练集自动峰数="
+            f"{len(relative_peak_intensity_constraint_state['detected_peak_indices'])}；"
+            "峰中心="
+            f"{np.round(relative_peak_intensity_constraint_state['detected_peak_centers_cm1'], 3).tolist()}"
+        )
+    else:
+        print("D3.2自动峰区相对峰强约束：未启用")
 
     # ------------------------------------------------------------------
     # D3 diversity
@@ -1865,6 +2046,13 @@ def main() -> None:
             length_adapter.adapt(
                 constraint_reference_priors
             )
+        )
+
+    if peak_derivative_enabled or relative_peak_enabled:
+        if constraint_reconstruction_bases_full is None:
+            raise RuntimeError("D3.1/D3.2恢复基底尚未构建。")
+        padded_constraint_reference_priors = length_adapter.adapt(
+            constraint_reconstruction_bases_full
         )
 
     spectrum_dataset = (
@@ -2090,6 +2278,42 @@ def main() -> None:
             ),
         )
 
+    if peak_derivative_constraint_state is not None:
+        configure_peak_derivative = getattr(
+            diffusion,
+            "configure_peak_derivative_constraints",
+            None,
+        )
+        if not callable(configure_peak_derivative):
+            raise RuntimeError(
+                "D3.1扩散模型缺少"
+                "configure_peak_derivative_constraints。"
+            )
+        configure_peak_derivative(
+            peak_derivative_constraint_state=(
+                peak_derivative_constraint_state
+            ),
+            broad_local_residual_state=broad_local_residual_state,
+        )
+
+    if relative_peak_intensity_constraint_state is not None:
+        configure_relative_peak = getattr(
+            diffusion,
+            "configure_relative_peak_intensity_constraints",
+            None,
+        )
+        if not callable(configure_relative_peak):
+            raise RuntimeError(
+                "D3.2扩散模型缺少"
+                "configure_relative_peak_intensity_constraints。"
+            )
+        configure_relative_peak(
+            relative_peak_intensity_constraint_state=(
+                relative_peak_intensity_constraint_state
+            ),
+            broad_local_residual_state=broad_local_residual_state,
+        )
+
     if (
         diversity_constraint_state
         is not None
@@ -2205,6 +2429,12 @@ def main() -> None:
         ),
         "physics_constraint_state": (
             physics_constraint_state
+        ),
+        "peak_derivative_constraint_state": (
+            peak_derivative_constraint_state
+        ),
+        "relative_peak_intensity_constraint_state": (
+            relative_peak_intensity_constraint_state
         ),
         "diversity_constraint_state": (
             diversity_constraint_state

@@ -1243,9 +1243,25 @@ def main() -> None:
             )
         else:
             print("整谱拉曼轴微漂移：未启用")
+        if calibration_summary["peak_height_compression_enabled"]:
+            print(
+                "自动峰高离散度压缩：已启用；"
+                "候选峰数"
+                f"{calibration_summary['height_compression_peak_count']}；"
+                "实际压缩主峰数"
+                f"{calibration_summary['height_compression_active_peak_count']}；"
+                "高度离散CV中位数"
+                f"{calibration_summary['height_cv_before']:.6g}→"
+                f"{calibration_summary['height_cv_after']:.6g}；"
+                "压缩系数"
+                f"{calibration_summary['height_variation_scale']:.3f}"
+            )
+        else:
+            print("自动峰高离散度压缩：未启用")
     else:
         print("非峰区杂讯频带校准：未启用")
         print("整谱拉曼轴微漂移：未启用")
+        print("自动峰高离散度压缩：未启用")
     if feature_peak_residual_limiter is not None:
         limiter_summary = feature_peak_residual_limiter.summary()
         print(

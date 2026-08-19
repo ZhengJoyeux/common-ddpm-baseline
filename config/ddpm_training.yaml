@@ -1,466 +1,241 @@
 project:
-  # D2.5：
-  # 3-component stochastic PCA prior
-  # + robust_asinh residual
-  # + ordinary unconditional DDPM
-  name: d2_6_broad_local_pca6_robust_asinh_s001_1200
-
+  name: d3_3_tuned_jitter1p2_height0p90_d2_6_2000step_s001
   random_seed: 2026
-
-
 diagnostic_overfit:
   enabled: false
-
   spectrum_index: 0
-
   repeat_count: 50
-
-
 data:
-  # 当前仍然只做 S001 单一条件模型诊断。
-  # 不得把不同农药、浓度或基质混入当前无条件 D2.5。
   input_directory: data/input/S001
-
   recursive: false
-
   allowed_extensions:
-    - .xlsx
-    - .xls
-    - .csv
-
+  - .xlsx
+  - .xls
+  - .csv
   sheet_name: 0
-
-  # 当前 S001 CSV 第一行按实际文件格式读取。
   header_row: null
-
   raman_shift_column: 0
-
   intensity_start_column: 1
-
   require_same_raman_shift_axis: false
-
-  raman_shift_tolerance: 1.0e-6
-
+  raman_shift_tolerance: 1.0e-06
   raman_range_tolerance: 1.0
-
   original_spectrum_length: auto
-
   model_spectrum_length: auto
-
-  # 必须按照 Raman shift 轴插值，
-  # 不能按数组下标直接截断。
   length_adaptation: raman_axis_interpolation
-
   padding_mode: right_zero_padding
-
   padding_value: 0.0
-
-  # 当前 20 条 S001 的模型开发实验：
-  # 16 train / 2 validation / 2 test。
-  #
-  # 如果这20条属于同一个独立实验样品，
-  # 此划分只用于当前算法诊断，
-  # 不能用于论文中的独立泛化结论。
   split_unit: spectrum
-
   train_ratio: 0.8
-
   validation_ratio: 0.1
-
   test_ratio: 0.1
-
   shuffle: true
-
-
 normalization:
   enabled: true
-
   method: global_minmax
-
-  # 必须只使用 train 拟合。
   fit_on: train_only
-
   target_min: -1.0
-
   target_max: 1.0
-
   clip: false
-
   epsilon: 1.0e-12
-
   save_in_checkpoint: true
-
-
 prior_residual:
   enabled: true
-
-  # ------------------------------------------------------------
-  # D2.5 核心：3主成分随机PCA prior。
-  #
-  # 训练时：
-  #   每条真实谱使用训练集PCA子空间中的自身重构作为prior；
-  #   DDPM只学习原谱相对于该低秩重构的剩余残差。
-  #
-  # 生成时：
-  #   从训练集PCA score分布采样可变prior；
-  #   再加回DDPM生成的robust_asinh残差。
-  #
-  # 峰位和峰形均由当前训练集自动学习，
-  # 不写死任何DEL、CHL或TEB特征峰位置。
-  # ------------------------------------------------------------
-
   prior_method: pca_reconstruction
-
-  # 先按95%累计解释方差确定所需数量，
-  # 再强制最多保留3个主成分。
-  # 对当前16条训练谱，最终应显示PCA主成分数为3。
   pca_explained_variance_ratio: 0.95
-
   pca_max_components: 6
-  # 使用真正的逐主成分截断高斯采样。
-  # 旧的truncated_gaussian_scores实际是采样后clip，
-  # 会在±1.5标准差边界堆积大量prior，本轮不使用。
   pca_sampling_strategy: independent_truncated_gaussian_scores
-
-  # 将每个PCA score限制在训练均值±1.5个标准差内，
-  # 减少小样本高斯外推产生的异常prior。
   pca_score_clip_standard_deviations: 2.5
-  # ------------------------------------------------------------
-  # 必须使用 robust_asinh。
-  #
-  # 本轮固定使用robust_asinh，不能同时切换归一化方法，
-  # 保证与D2.4比较时只改变prior设计这一主要变量。
-  # ------------------------------------------------------------
-
   residual_normalization: robust_asinh
-
   residual_quantile: 99.5
-
   target_abs_max: 1.0
-
-  epsilon: 1.0e-8
-
-  # 以下两个字段仅为旧D2.1配置兼容保留，
-  # 当前robust_asinh不使用。
+  epsilon: 1.0e-08
   mad_scale_factor: 1.4826
-
   pointwise_scale_floor_quantile: 10.0
-
-
-# ==============================================================
-# D3模块
-#
-# 本轮必须全部关闭。
-#
-# 我们当前只验证：
-#
-# training-set PCA fit
-#       ↓
-# 3-component variable reconstruction prior
-#       ↓
-# robust_asinh residual
-#       ↓
-# ordinary DDPM
-#
-# 不能同时混入D3，否则无法判断D2.4是否有效。
-# ==============================================================
-
-
-# ----------------------------------------------------------------------
-# D2.6：broad-local residual decomposition
-#
-# outer prior仍是D2.5 PCA6。
-# raw residual = normalized spectrum - PCA6 reconstruction
-# residual = broad + local
-#
-# broad：train-only PCA低维采样；
-# local：robust_asinh后交给DDPM学习。
-#
-# 该模块属于模型/残差表示改进，不是sampling post-processing。
-# ----------------------------------------------------------------------
 broad_local_residual:
   enabled: true
-
   broad_filter:
     method: gaussian
     sigma_cm1: 7.0
     truncate: 4.0
-
   broad_prior:
     method: pca
     pca_explained_variance_ratio: 0.95
     pca_max_components: 6
     sampling_strategy: independent_truncated_gaussian_scores
     score_clip_standard_deviations: 2.5
-
   local_normalization:
     method: robust_asinh
     residual_quantile: 99.5
     target_abs_max: 1.0
-
-  epsilon: 1.0e-8
-
-
+  epsilon: 1.0e-08
 physics_constraints:
   enabled: false
-
-
+peak_derivative_constraints:
+  enabled: false
+  reference_baseline_sigma_cm1: 30.0
+  reference_peak_smoothing_sigma_cm1: 2.0
+  minimum_relative_prominence: 0.06
+  minimum_peak_distance_cm1: 12.0
+  maximum_peak_count: 10
+  edge_exclusion_cm1: 24.0
+  peak_core_half_width_cm1: 18.0
+  transition_width_cm1: 6.0
+  derivative_scale_quantile: 95.0
+  minimum_derivative_scale: 0.0001
+  smooth_l1_beta: 0.25
+  timestep_weight_power: 1.0
+  minimum_timestep_weight: 0.0
+  total_weight: 1.0
+  maximum_total_ratio_to_ddpm: 0.05
+  numerical_safety_limit: 12.0
+  epsilon: 1.0e-08
+relative_peak_intensity_constraints:
+  enabled: false
+  reference_baseline_sigma_cm1: 30.0
+  reference_peak_smoothing_sigma_cm1: 2.0
+  minimum_relative_prominence: 0.06
+  minimum_peak_distance_cm1: 12.0
+  maximum_peak_count: 10
+  minimum_peak_count: 2
+  edge_exclusion_cm1: 24.0
+  peak_half_width_cm1: 12.0
+  baseline_inner_half_width_cm1: 18.0
+  baseline_outer_half_width_cm1: 30.0
+  minimum_relative_height_fraction: 0.03
+  log_ratio_margin_iqr: 1.5
+  minimum_log_ratio_width: 0.08
+  smooth_l1_beta: 0.25
+  timestep_weight_power: 1.0
+  minimum_timestep_weight: 0.0
+  total_weight: 1.0
+  maximum_total_ratio_to_ddpm: 0.05
+  numerical_safety_limit: 12.0
+  epsilon: 1.0e-08
 diversity_constraints:
   enabled: false
-
-
 feature_peak_residual_limiter:
   enabled: false
-
-
 local_peak_distribution_constraints:
   enabled: false
-
-
 model:
   channels: 1
-
   model_dimension: 16
-
   dimension_multipliers:
-    - 1
-    - 2
-    - 4
-
+  - 1
+  - 2
+  - 4
   dropout: 0.0
-
   self_condition: false
-
-  # 保留历史兼容字段。
   diffusion_timesteps: 100
-
   sampling_timesteps: 50
-
   objective: pred_x0
-
   beta_schedule: cosine
-
   ddim_sampling_eta: 0.0
-
   auto_normalize: false
-
-
 diffusion:
   diffusion_steps: 100
-
   sampling_steps: 50
-
   objective: pred_x0
-
   beta_schedule: cosine
-
   ddim_sampling_eta: 0.0
-
-  # 项目外部已经完成global_minmax，
-  # 必须关闭第三方库自动归一化。
   auto_normalize: false
-
-  # 与前面 D2 对照保持一致。
   loss_weighting: uniform
-
-  # 当前关闭。
   residual_aware_loss:
     enabled: false
-
-
 training:
   device: cuda
-
-  # 当前 S001：
-  # train约16条。
   batch_size: 8
-
-  # 约2 step / epoch。
-  # 600 epoch ≈ 1200 optimizer steps。
-  number_of_epochs: 600
-
+  number_of_epochs: 1000
   learning_rate: 0.0001
-
   weight_decay: 0.0
-
   number_of_workers: 0
-
   pin_memory: true
-
   drop_last: false
-
-  # 50 epoch × 约2 step
-  # ≈ 每100 step验证一次。
-  validate_every_epochs: 50
-
-  # ≈ 每100 step保存一次，
-  # 不再像上次那样每10 step保存。
-  save_every_epochs: 50
-
+  validate_every_epochs: 500
+  save_every_epochs: 500
   log_every_batches: 1
-
   gradient_accumulation_steps: 1
-
   maximum_gradient_norm: 1.0
-
   use_mixed_precision: false
-
   ema_decay: 0.995
-
   ema_update_every: 1
-
   maximum_validation_batches: 0
-
   validation_random_seed: 2026001
-
-
 output:
-  output_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200
-
-  checkpoint_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/checkpoints
-
-  log_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/logs
-
-  generated_spectrum_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/generated/ddim50_ema_no_sampling_calibration
-
-  preview_plot_directory: outputs/experiments/d2_6_broad_local_pca6_robust_asinh_s001_1200/plots/ddim50_ema_no_sampling_calibration
-
+  output_directory: outputs/experiments/d3_3_peak_jitter_height_compression_d2_6_2000step_s001
+  checkpoint_directory: outputs/experiments/d3_3_peak_jitter_height_compression_d2_6_2000step_s001/checkpoints
+  log_directory: outputs/experiments/d3_3_peak_jitter_height_compression_d2_6_2000step_s001/logs
+  generated_spectrum_directory: outputs/experiments/d3_3_tuned_jitter1p2_height0p90_d2_6_2000step_s001/generated/ddim50_ema_peak_jitter_height_compression
+  preview_plot_directory: outputs/experiments/d3_3_tuned_jitter1p2_height0p90_d2_6_2000step_s001/plots/ddim50_ema_peak_jitter_height_compression
   latest_checkpoint_name: latest.pt
-
   best_checkpoint_name: best.pt
-
   training_log_name: training_log.csv
-
   split_assignment_name: split_assignment.csv
-
-
 generation:
   number_of_spectra: 100
-
   batch_size: 10
-
   model_source: ema
-
   crop_to_original_length: true
-
   inverse_normalize: true
-
-  # 不再对整条光谱做统一0.90收缩。
-  # 统一收缩会同时压小峰位、峰形和峰强差异，
-  # 不能针对性解决非峰区杂讯带过宽的问题。
-  variation_scale: 1.00
-
-  # PCA prior score截断的生成端临时覆盖。
-  # null表示严格使用checkpoint原值；实验时优先用CLI覆盖。
-  # 该字段不会写回checkpoint。
+  variation_scale: 1.0
   pca_score_clip_override_standard_deviations: null
-  # D2.5生成阶段定向校准，不修改best.pt，也不重新训练。
-  # 所有峰区均从checkpoint中的训练集PCA均值谱自动检测，
-  # 不写死任何农药或特征峰位置。
   sampling_calibration:
-    enabled: false
-
-    # 只压缩非峰区的宽杂讯成分；自动识别出的峰区保持原样。
+    enabled: true
     non_peak_noise:
-      enabled: true
-
-      # 用于从PCA均值谱分离缓慢基线并自动找峰。
+      enabled: false
       reference_smoothing_sigma_cm1: 30.0
       minimum_relative_prominence: 0.06
       minimum_peak_distance_cm1: 12.0
       maximum_peak_count: 20
-
-      # 峰中心左右24 cm^-1完全保护，随后6 cm^-1平滑过渡。
       peak_protection_half_width_cm1: 24.0
       transition_width_cm1: 6.0
-
-      # 非峰区分解为：
-      # broad + middle + fine。
-      # middle主要对应底部较宽的波动，因此压到0.55；
-      # fine保留0.85，避免把真实SERS细噪声全部抹平。
       fine_sigma_cm1: 1.5
       broad_sigma_cm1: 7.0
       broad_variation_scale: 0.46
       middle_component_scale: 0.55
       fine_component_scale: 0.85
-
-    # 对每条完整光谱施加一个共同轴漂移：
-    # 同一条谱的全部峰一起移动，峰间距保持不变。
     raman_shift_jitter:
       enabled: true
       distribution: truncated_normal
-      standard_deviation_cm1: 3.0
-      maximum_absolute_shift_cm1: 5.0
-
-
-  # ------------------------------------------------------------
-  # 实验C：训练集驱动的生成光谱质量guard
-  #
-  # 注意：
-  # 1. 只根据checkpoint记录的真实训练集拟合；
-  # 2. 峰位自动检测，不写死任何农药峰位；
-  # 3. 只做接受/拒绝，不修改光谱强度；
-  # 4. 当前broad calibration继续保持关闭。
-  # ------------------------------------------------------------
+      standard_deviation_cm1: 1.2
+      maximum_absolute_shift_cm1: 3.0
+    peak_height_compression:
+      enabled: true
+      reference_smoothing_sigma_cm1: 30.0
+      reference_peak_smoothing_sigma_cm1: 2.0
+      minimum_relative_prominence: 0.06
+      minimum_peak_distance_cm1: 12.0
+      maximum_peak_count: 10
+      peak_half_width_cm1: 12.0
+      transition_width_cm1: 6.0
+      height_variation_scale: 0.9
+      minimum_batch_peak_median_height_fraction: 0.05
+      minimum_valid_height: 1.0e-08
+      minimum_factor: 0.65
+      maximum_factor: 1.25
   training_guard:
     enabled: true
-
     reference_smoothing_sigma_cm1: 30.0
     minimum_relative_prominence: 0.06
     minimum_peak_distance_cm1: 12.0
     maximum_peak_count: 20
-
     metric_half_width_cm1: 24.0
-
-    # 峰位边界 = 训练集观测最小/最大值 ± 2 cm^-1。
     position_margin_cm1: 2.0
-
-    # 峰高、FWHM和负谷使用训练范围 + 1.5×IQR作为宽松保护边界。
-    # 这是outlier guard，不是把生成分布压回训练均值。
     bound_margin_iqr: 1.5
-
     minimum_valid_training_count: 8
-
-    # 只把训练集中稳定的主要峰用于质量guard。
-    # 候选峰的训练峰高中位数必须达到
-    # 全部候选峰最大中位峰高的5%。
-    # 完全由当前训练集自动计算，不写死任何峰位。
     minimum_guard_peak_median_height_fraction: 0.05
-
     check_peak_position: true
     check_peak_height: true
     check_peak_width: true
     check_negative_minimum: true
-
-    # 允许少量自动峰出现单次指标越界。
-    # 超过20%的guard峰越界才拒绝整条光谱。
-    maximum_peak_violation_fraction: 0.20
-
-
-  # ------------------------------------------------------------
-  # Experiment D：最终生成光谱统一评价
-  #
-  # 只做评价，不训练、不生成、不校准、不修改任何生成光谱。
-  # PCA及所有参考统计只在checkpoint记录的training split上拟合。
-  # validation/test仅作为held-out参考，不用于调参。
-  # ------------------------------------------------------------
+    maximum_peak_violation_fraction: 0.2
   final_evaluation:
     random_seed: 2026
-
-    # 与当前PCA6生成模型保持一致，评价PCA也使用6维训练集子空间。
     pca_components: 6
-
-    # 真实train=16条时，每次从生成谱中随机抽16条做公平分布比较。
     bootstrap_repeats: 500
-
-    # 生成谱内部成对多样性随机抽样数量；代码使用分块计算避免占满内存。
     generated_pair_count: 50000
-
-    # 与前面A/B诊断保持一致的broad低频分解尺度。
     broad_sigma_cm1: 7.0
-
   output_filename: generated_spectra.xlsx
-
   output_formats:
-    - xlsx
-    - csv
+  - xlsx
+  - csv

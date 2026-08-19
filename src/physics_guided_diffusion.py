@@ -28,6 +28,14 @@ from src.sers_physics_constraints import (
     DifferentiableSersPhysicsLoss,
     normalize_physics_configuration,
 )
+from src.sers_peak_derivative_constraints import (
+    DifferentiablePeakDerivativeLoss,
+    normalize_peak_derivative_configuration,
+)
+from src.sers_relative_peak_intensity_constraints import (
+    DifferentiableRelativePeakIntensityLoss,
+    normalize_relative_peak_intensity_configuration,
+)
 
 
 T = TypeVar("T")
@@ -140,10 +148,12 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         physics_configuration: dict[str, Any] | None = None,
         diversity_configuration: dict[str, Any] | None = None,
         local_peak_distribution_configuration: dict[str, Any] | None = None,
+        peak_derivative_configuration: dict[str, Any] | None = None,
+        relative_peak_intensity_configuration: dict[str, Any] | None = None,
         residual_aware_configuration: dict[str, Any] | None = None,
         **kwargs,
     ) -> None:
-        # 四个项目自定义配置必须在这里显式接住，不能进入第三方 **kwargs。
+        # 项目自定义配置必须在这里显式接住，不能进入第三方 **kwargs。
         super().__init__(model, **kwargs)
 
         self.physics_configuration = normalize_physics_configuration(
@@ -155,6 +165,16 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         self.local_peak_distribution_configuration = (
             normalize_local_peak_distribution_configuration(
                 local_peak_distribution_configuration or {"enabled": False}
+            )
+        )
+        self.peak_derivative_configuration = (
+            normalize_peak_derivative_configuration(
+                peak_derivative_configuration or {"enabled": False}
+            )
+        )
+        self.relative_peak_intensity_configuration = (
+            normalize_relative_peak_intensity_configuration(
+                relative_peak_intensity_configuration or {"enabled": False}
             )
         )
         self.residual_aware_configuration = (
@@ -172,6 +192,12 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         self.local_peak_distribution_enabled = bool(
             self.local_peak_distribution_configuration.get("enabled", False)
         )
+        self.peak_derivative_enabled = bool(
+            self.peak_derivative_configuration.get("enabled", False)
+        )
+        self.relative_peak_intensity_enabled = bool(
+            self.relative_peak_intensity_configuration.get("enabled", False)
+        )
         self.residual_aware_enabled = bool(
             self.residual_aware_configuration.get("enabled", False)
         )
@@ -181,12 +207,15 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
                 self.physics_enabled,
                 self.diversity_enabled,
                 self.local_peak_distribution_enabled,
+                self.peak_derivative_enabled,
+                self.relative_peak_intensity_enabled,
                 self.residual_aware_enabled,
             )
         ):
             raise ValueError(
                 "SersPhysicsGuidedGaussianDiffusion1D至少需要启用"
-                "physics、diversity、local_peak_distribution或"
+                "physics、diversity、local_peak_distribution、"
+                "peak_derivative、relative_peak_intensity或"
                 "residual_aware之一。"
             )
 
@@ -222,6 +251,12 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
         self.diversity_loss_module: DifferentiableSersDiversityLoss | None = None
         self.local_peak_distribution_loss_module: (
             DifferentiableSersLocalPeakDistributionLoss | None
+        ) = None
+        self.peak_derivative_loss_module: (
+            DifferentiablePeakDerivativeLoss | None
+        ) = None
+        self.relative_peak_intensity_loss_module: (
+            DifferentiableRelativePeakIntensityLoss | None
         ) = None
 
         self._latest_loss_components: dict[str, torch.Tensor] = {}
@@ -294,6 +329,46 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
             padded_length=self.seq_length,
         )
         self._sync_diversity_inverse_reference()
+
+    def configure_peak_derivative_constraints(
+        self,
+        *,
+        peak_derivative_constraint_state: dict[str, Any],
+        broad_local_residual_state: dict[str, Any],
+    ) -> None:
+        """配置D3.1训练损失；不改变采样状态或U-Net参数结构。"""
+
+        if not self.peak_derivative_enabled:
+            return
+
+        self.peak_derivative_loss_module = DifferentiablePeakDerivativeLoss(
+            peak_derivative_constraint_state=(
+                peak_derivative_constraint_state
+            ),
+            broad_local_residual_state=broad_local_residual_state,
+            padded_length=self.seq_length,
+        )
+
+    def configure_relative_peak_intensity_constraints(
+        self,
+        *,
+        relative_peak_intensity_constraint_state: dict[str, Any],
+        broad_local_residual_state: dict[str, Any],
+    ) -> None:
+        """配置D3.2训练损失；不改变采样状态或U-Net参数结构。"""
+
+        if not self.relative_peak_intensity_enabled:
+            return
+
+        self.relative_peak_intensity_loss_module = (
+            DifferentiableRelativePeakIntensityLoss(
+                relative_peak_intensity_constraint_state=(
+                    relative_peak_intensity_constraint_state
+                ),
+                broad_local_residual_state=broad_local_residual_state,
+                padded_length=self.seq_length,
+            )
+        )
 
     def get_latest_loss_components(self) -> dict[str, torch.Tensor]:
         return {
@@ -514,11 +589,99 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
             local_peak_loss_scale = zero
             weighted_local_peak_loss = zero
 
+        if self.peak_derivative_enabled:
+            if self.peak_derivative_loss_module is None:
+                raise RuntimeError(
+                    "D3.1扩散模型尚未配置peak derivative state。"
+                )
+
+            peak_derivative = self.peak_derivative_loss_module(
+                predicted_scaled_local_residual=model_out,
+                target_scaled_local_residual=x_start,
+                reconstruction_base=constraint_reference_prior,
+                timesteps=t,
+                alphas_cumprod=self.alphas_cumprod,
+            )
+            peak_derivative_candidate = (
+                float(self.peak_derivative_configuration["total_weight"])
+                * peak_derivative[
+                    "peak_derivative_timestep_weighted_loss"
+                ]
+            )
+            peak_derivative_loss_cap = (
+                ddpm_loss.detach()
+                * float(
+                    self.peak_derivative_configuration[
+                        "maximum_total_ratio_to_ddpm"
+                    ]
+                )
+            )
+            peak_derivative_loss_scale = torch.clamp(
+                peak_derivative_loss_cap
+                / peak_derivative_candidate.detach().abs().clamp_min(1.0e-12),
+                max=1.0,
+            )
+            weighted_peak_derivative_loss = (
+                peak_derivative_candidate * peak_derivative_loss_scale
+            )
+        else:
+            peak_derivative = {}
+            peak_derivative_candidate = zero
+            peak_derivative_loss_cap = zero
+            peak_derivative_loss_scale = zero
+            weighted_peak_derivative_loss = zero
+
+        if self.relative_peak_intensity_enabled:
+            if self.relative_peak_intensity_loss_module is None:
+                raise RuntimeError(
+                    "D3.2扩散模型尚未配置relative peak intensity state。"
+                )
+
+            relative_peak = self.relative_peak_intensity_loss_module(
+                predicted_scaled_local_residual=model_out,
+                target_scaled_local_residual=x_start,
+                reconstruction_base=constraint_reference_prior,
+                timesteps=t,
+                alphas_cumprod=self.alphas_cumprod,
+            )
+            relative_peak_candidate = (
+                float(
+                    self.relative_peak_intensity_configuration[
+                        "total_weight"
+                    ]
+                )
+                * relative_peak["relative_peak_intensity_loss"]
+            )
+            relative_peak_loss_cap = (
+                ddpm_loss.detach()
+                * float(
+                    self.relative_peak_intensity_configuration[
+                        "maximum_total_ratio_to_ddpm"
+                    ]
+                )
+            )
+            relative_peak_loss_scale = torch.clamp(
+                relative_peak_loss_cap
+                / relative_peak_candidate.detach().abs().clamp_min(1.0e-12),
+                max=1.0,
+            )
+            weighted_relative_peak_loss = (
+                relative_peak_candidate * relative_peak_loss_scale
+            )
+        else:
+            relative_peak = {}
+            relative_peak_candidate = zero
+            relative_peak_loss_cap = zero
+            relative_peak_loss_scale = zero
+            weighted_relative_peak_loss = zero
+
         total_loss = (
             ddpm_loss
             + weighted_physics_loss
             + weighted_diversity_loss
             + weighted_local_peak_loss
+            + weighted_peak_derivative_loss
+            + weighted_relative_peak_loss
         )
 
         self._latest_loss_components = {
@@ -648,6 +811,54 @@ class SersPhysicsGuidedGaussianDiffusion1D(GaussianDiffusion1D):
             "local_peak_count": local_peak.get("local_peak_count", zero),
             "mean_local_peak_timestep_weight": local_peak.get(
                 "mean_local_peak_timestep_weight", zero
+            ),
+
+            "peak_derivative_loss": weighted_peak_derivative_loss,
+            "peak_derivative_candidate_loss": peak_derivative_candidate,
+            "peak_derivative_raw_loss": peak_derivative.get(
+                "peak_derivative_raw_loss", zero
+            ),
+            "peak_derivative_timestep_weighted_loss": peak_derivative.get(
+                "peak_derivative_timestep_weighted_loss", zero
+            ),
+            "peak_derivative_loss_cap": peak_derivative_loss_cap,
+            "peak_derivative_loss_scale": peak_derivative_loss_scale,
+            "mean_peak_derivative_timestep_weight": peak_derivative.get(
+                "mean_peak_derivative_timestep_weight", zero
+            ),
+            "mean_peak_derivative_absolute_error": peak_derivative.get(
+                "mean_peak_derivative_absolute_error", zero
+            ),
+
+            "relative_peak_intensity_loss": weighted_relative_peak_loss,
+            "relative_peak_intensity_candidate_loss": (
+                relative_peak_candidate
+            ),
+            "relative_peak_intensity_boundary_loss": relative_peak.get(
+                "relative_peak_intensity_boundary_loss", zero
+            ),
+            "relative_peak_intensity_target_loss": relative_peak.get(
+                "relative_peak_intensity_target_loss", zero
+            ),
+            "relative_peak_intensity_loss_cap": relative_peak_loss_cap,
+            "relative_peak_intensity_loss_scale": relative_peak_loss_scale,
+            "mean_relative_peak_intensity_timestep_weight": (
+                relative_peak.get(
+                    "mean_relative_peak_intensity_timestep_weight",
+                    zero,
+                )
+            ),
+            "mean_relative_peak_intensity_boundary_error": (
+                relative_peak.get(
+                    "mean_relative_peak_intensity_boundary_error",
+                    zero,
+                )
+            ),
+            "mean_relative_peak_intensity_target_error": relative_peak.get(
+                "mean_relative_peak_intensity_target_error", zero
+            ),
+            "mean_relative_peak_height": relative_peak.get(
+                "mean_relative_peak_height", zero
             ),
         }
 

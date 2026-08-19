@@ -1,11 +1,13 @@
 """Training-reference-driven calibration for generated SERS spectra.
 
-This module performs two sampling-only operations:
+This module performs three sampling-only operations:
 
 1. suppress overly broad non-peak fluctuations while protecting peak windows
    detected automatically from the checkpoint PCA mean spectrum;
 2. apply a small whole-spectrum Raman-axis drift so all peaks in one spectrum
    move coherently and their relative spacing is preserved.
+3. compress overly broad generated feature-peak height dispersion around the
+   generated batch median while filtering weak shoulder/noise peaks.
 
 No pesticide-specific peak position is hard-coded.
 """
@@ -51,17 +53,31 @@ class SersSamplingCalibrator:
         self.raman_shift_jitter_configuration = self._read_section(
             "raman_shift_jitter"
         )
+        self.peak_height_compression_configuration = self._read_section(
+            "peak_height_compression"
+        )
         self.non_peak_noise_enabled = bool(
             self.non_peak_noise_configuration.get("enabled", False)
         )
         self.raman_shift_jitter_enabled = bool(
             self.raman_shift_jitter_configuration.get("enabled", False)
         )
+        self.peak_height_compression_enabled = bool(
+            self.peak_height_compression_configuration.get(
+                "enabled", False
+            )
+        )
 
-        if not self.non_peak_noise_enabled and not self.raman_shift_jitter_enabled:
+        if not any(
+            (
+                self.non_peak_noise_enabled,
+                self.raman_shift_jitter_enabled,
+                self.peak_height_compression_enabled,
+            )
+        ):
             raise ValueError(
-                "sampling_calibration已启用，但non_peak_noise和"
-                "raman_shift_jitter均未启用。"
+                "sampling_calibration已启用，但non_peak_noise、"
+                "raman_shift_jitter和peak_height_compression均未启用。"
             )
 
         self._axis_spacing = float(np.median(np.diff(self.raman_shift)))
@@ -73,12 +89,23 @@ class SersSamplingCalibrator:
         self._last_shift_offsets = np.empty(0, dtype=np.float64)
         self._last_noise_width_before = 0.0
         self._last_noise_width_after = 0.0
+        self._height_compression_peak_indices = np.empty(
+            0, dtype=np.int64
+        )
+        self._last_height_compression_summary = {
+            "active_peak_count": 0,
+            "median_height_cv_before": 0.0,
+            "median_height_cv_after": 0.0,
+        }
 
         if self.non_peak_noise_enabled:
             self._prepare_non_peak_noise_calibration()
 
         if self.raman_shift_jitter_enabled:
             self._validate_shift_configuration()
+
+        if self.peak_height_compression_enabled:
+            self._prepare_peak_height_compression()
 
     @staticmethod
     def _validate_axis(values: np.ndarray) -> np.ndarray:
@@ -249,6 +276,122 @@ class SersSamplingCalibrator:
             "maximum_absolute_shift_cm1",
         )
 
+    def _detect_reference_peaks(
+        self,
+        *,
+        reference_smoothing_sigma_cm1: float,
+        peak_smoothing_sigma_cm1: float,
+        minimum_relative_prominence: float,
+        minimum_peak_distance_cm1: float,
+        maximum_peak_count: int,
+    ) -> np.ndarray:
+        reference_baseline = gaussian_filter1d(
+            self.reference_spectrum,
+            sigma=self._sigma_in_samples(reference_smoothing_sigma_cm1),
+            mode="nearest",
+        )
+        peak_signal = gaussian_filter1d(
+            self.reference_spectrum - reference_baseline,
+            sigma=self._sigma_in_samples(peak_smoothing_sigma_cm1),
+            mode="nearest",
+        )
+        signal_span = float(np.ptp(peak_signal))
+        if signal_span <= np.finfo(np.float64).eps:
+            raise RuntimeError("PCA均值参考谱没有可识别的峰形变化。")
+
+        peak_indices, properties = find_peaks(
+            peak_signal,
+            prominence=minimum_relative_prominence * signal_span,
+            distance=max(
+                1,
+                int(round(minimum_peak_distance_cm1 / self._axis_spacing)),
+            ),
+        )
+        if peak_indices.size == 0:
+            raise RuntimeError(
+                "未能从checkpoint的PCA均值谱自动识别特征峰；"
+                "请检查minimum_relative_prominence。"
+            )
+
+        if peak_indices.size > maximum_peak_count:
+            prominences = np.asarray(properties["prominences"], dtype=np.float64)
+            selected = np.argsort(prominences)[-maximum_peak_count:]
+            peak_indices = np.sort(peak_indices[selected])
+
+        return peak_indices.astype(np.int64, copy=False)
+
+    def _prepare_peak_height_compression(self) -> None:
+        config = self.peak_height_compression_configuration
+
+        self._height_reference_sigma_cm1 = self._finite_positive(
+            config.get("reference_smoothing_sigma_cm1", 30.0),
+            "peak_height_compression.reference_smoothing_sigma_cm1",
+        )
+        detect_smoothing_sigma_cm1 = self._finite_positive(
+            config.get("reference_peak_smoothing_sigma_cm1", 2.0),
+            "peak_height_compression.reference_peak_smoothing_sigma_cm1",
+        )
+        minimum_relative_prominence = self._unit_interval(
+            config.get("minimum_relative_prominence", 0.06),
+            "peak_height_compression.minimum_relative_prominence",
+        )
+        minimum_peak_distance_cm1 = self._finite_positive(
+            config.get("minimum_peak_distance_cm1", 12.0),
+            "peak_height_compression.minimum_peak_distance_cm1",
+        )
+        maximum_peak_count = int(config.get("maximum_peak_count", 10))
+        if maximum_peak_count <= 0:
+            raise ValueError(
+                "peak_height_compression.maximum_peak_count必须大于0。"
+            )
+
+        self._height_peak_half_width_cm1 = self._finite_positive(
+            config.get("peak_half_width_cm1", 12.0),
+            "peak_height_compression.peak_half_width_cm1",
+        )
+        self._height_transition_width_cm1 = self._finite_positive(
+            config.get("transition_width_cm1", 6.0),
+            "peak_height_compression.transition_width_cm1",
+        )
+        self._height_variation_scale = self._unit_interval(
+            config.get("height_variation_scale", 0.70),
+            "peak_height_compression.height_variation_scale",
+        )
+        if self._height_variation_scale <= 0.0:
+            raise ValueError(
+                "peak_height_compression.height_variation_scale必须大于0。"
+            )
+
+        self._minimum_batch_peak_median_height_fraction = self._unit_interval(
+            config.get("minimum_batch_peak_median_height_fraction", 0.05),
+            "peak_height_compression.minimum_batch_peak_median_height_fraction",
+        )
+        self._minimum_valid_height = self._finite_positive(
+            config.get("minimum_valid_height", 1.0e-8),
+            "peak_height_compression.minimum_valid_height",
+        )
+        self._height_minimum_factor = self._finite_positive(
+            config.get("minimum_factor", 0.65),
+            "peak_height_compression.minimum_factor",
+        )
+        self._height_maximum_factor = self._finite_positive(
+            config.get("maximum_factor", 1.25),
+            "peak_height_compression.maximum_factor",
+        )
+        if self._height_minimum_factor > self._height_maximum_factor:
+            raise ValueError(
+                "peak_height_compression.minimum_factor不能大于"
+                "maximum_factor。"
+            )
+
+        self._height_compression_peak_indices = self._detect_reference_peaks(
+            reference_smoothing_sigma_cm1=self._height_reference_sigma_cm1,
+            peak_smoothing_sigma_cm1=detect_smoothing_sigma_cm1,
+            minimum_relative_prominence=minimum_relative_prominence,
+            minimum_peak_distance_cm1=minimum_peak_distance_cm1,
+            maximum_peak_count=maximum_peak_count,
+        )
+
     def _calibrate_non_peak_noise(self, spectra: np.ndarray) -> np.ndarray:
         fine_smooth = gaussian_filter1d(
             spectra,
@@ -329,6 +472,131 @@ class SersSamplingCalibrator:
             )
         return shifted
 
+    def _peak_apply_weight(self, center: float) -> np.ndarray:
+        distance = np.abs(self.raman_shift - float(center))
+        weight = np.zeros(self.raman_shift.size, dtype=np.float64)
+        weight[distance <= self._height_peak_half_width_cm1] = 1.0
+        transition = (
+            (distance > self._height_peak_half_width_cm1)
+            & (
+                distance
+                < (
+                    self._height_peak_half_width_cm1
+                    + self._height_transition_width_cm1
+                )
+            )
+        )
+        phase = (
+            distance[transition] - self._height_peak_half_width_cm1
+        ) / self._height_transition_width_cm1
+        weight[transition] = 0.5 * (1.0 + np.cos(np.pi * phase))
+        return weight
+
+    @staticmethod
+    def _height_cv(values: np.ndarray) -> float:
+        return float(
+            np.std(values)
+            / max(abs(float(np.median(values))), np.finfo(np.float64).eps)
+        )
+
+    def _compress_peak_heights(self, spectra: np.ndarray) -> np.ndarray:
+        if self._height_compression_peak_indices.size == 0:
+            raise RuntimeError("峰高压缩没有可用的自动峰。")
+
+        baseline = gaussian_filter1d(
+            spectra,
+            sigma=self._sigma_in_samples(self._height_reference_sigma_cm1),
+            axis=1,
+            mode="nearest",
+        )
+        calibrated = spectra.copy()
+        centers = self.raman_shift[self._height_compression_peak_indices]
+
+        measured: list[tuple[float, np.ndarray, np.ndarray]] = []
+        medians = []
+        for center in centers:
+            distance = np.abs(self.raman_shift - float(center))
+            measure_mask = distance <= self._height_peak_half_width_cm1
+            if int(np.count_nonzero(measure_mask)) < 3:
+                continue
+            local_signal = calibrated - baseline
+            heights = np.max(local_signal[:, measure_mask], axis=1)
+            valid = (
+                np.isfinite(heights)
+                & (heights > self._minimum_valid_height)
+            )
+            if int(np.count_nonzero(valid)) < 5:
+                continue
+            measured.append((float(center), measure_mask, heights))
+            medians.append(float(np.median(heights[valid])))
+
+        if not medians:
+            self._last_height_compression_summary = {
+                "active_peak_count": 0,
+                "median_height_cv_before": 0.0,
+                "median_height_cv_after": 0.0,
+            }
+            return calibrated
+
+        height_threshold = (
+            self._minimum_batch_peak_median_height_fraction
+            * max(medians)
+        )
+        cv_before: list[float] = []
+        cv_after: list[float] = []
+        active_peak_count = 0
+
+        for (center, measure_mask, heights), median_height in zip(
+            measured, medians, strict=True
+        ):
+            if median_height < height_threshold:
+                continue
+
+            valid = (
+                np.isfinite(heights)
+                & (heights > self._minimum_valid_height)
+            )
+            target = float(np.median(heights[valid]))
+            new_heights = (
+                target
+                + self._height_variation_scale
+                * (heights - target)
+            )
+            factor = new_heights / np.maximum(
+                heights,
+                self._minimum_valid_height,
+            )
+            factor = np.clip(
+                factor,
+                self._height_minimum_factor,
+                self._height_maximum_factor,
+            )
+
+            local_signal = calibrated - baseline
+            adjusted = baseline + local_signal * factor[:, np.newaxis]
+            weight = self._peak_apply_weight(center)
+            calibrated = (
+                weight[np.newaxis, :] * adjusted
+                + (1.0 - weight[np.newaxis, :]) * calibrated
+            )
+
+            after_signal = calibrated - baseline
+            after_heights = np.max(after_signal[:, measure_mask], axis=1)
+            cv_before.append(self._height_cv(heights[valid]))
+            cv_after.append(self._height_cv(after_heights[valid]))
+            active_peak_count += 1
+
+        self._last_height_compression_summary = {
+            "active_peak_count": int(active_peak_count),
+            "median_height_cv_before": (
+                0.0 if not cv_before else float(np.median(cv_before))
+            ),
+            "median_height_cv_after": (
+                0.0 if not cv_after else float(np.median(cv_after))
+            ),
+        }
+        return calibrated
+
     def apply(self, spectra: np.ndarray) -> np.ndarray:
         """Apply configured calibration to spectra on the output Raman axis."""
 
@@ -367,6 +635,9 @@ class SersSamplingCalibrator:
                 calibrated.shape[0], dtype=np.float64
             )
 
+        if self.peak_height_compression_enabled:
+            calibrated = self._compress_peak_heights(calibrated)
+
         if not np.isfinite(calibrated).all():
             raise RuntimeError("sampling calibration结果包含NaN或无穷值。")
         return calibrated.astype(np.float32, copy=False)
@@ -386,7 +657,29 @@ class SersSamplingCalibrator:
         return {
             "non_peak_noise_enabled": self.non_peak_noise_enabled,
             "raman_shift_jitter_enabled": self.raman_shift_jitter_enabled,
+            "peak_height_compression_enabled": (
+                self.peak_height_compression_enabled
+            ),
             "detected_peak_count": int(self._peak_indices.size),
+            "height_compression_peak_count": int(
+                self._height_compression_peak_indices.size
+            ),
+            "height_compression_active_peak_count": int(
+                self._last_height_compression_summary["active_peak_count"]
+            ),
+            "height_cv_before": float(
+                self._last_height_compression_summary[
+                    "median_height_cv_before"
+                ]
+            ),
+            "height_cv_after": float(
+                self._last_height_compression_summary[
+                    "median_height_cv_after"
+                ]
+            ),
+            "height_variation_scale": getattr(
+                self, "_height_variation_scale", 1.0
+            ),
             "middle_component_scale": getattr(
                 self, "_middle_component_scale", 1.0
             ),
